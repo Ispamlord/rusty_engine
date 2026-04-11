@@ -399,3 +399,8 @@ FodyWeavers.xsd
 
 # JetBrains Rider
 *.sln.iml
+# Rust build output
+/target/
+
+# Backup and temp files
+*.rs.bk

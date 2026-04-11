@@ -1,0 +1,10 @@
+[package]
+name = "engine_core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ron.workspace = true
+serde.workspace = true
+thiserror.workspace = true

@@ -1,0 +1,12 @@
+[package]
+name = "engine_render_api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+engine_core = { path = "../engine_core" }
+raw-window-handle.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

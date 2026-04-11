@@ -1,0 +1,10 @@
+[package]
+name = "engine_physics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bevy_ecs.workspace = true
+rapier2d.workspace = true
+tracing.workspace = true

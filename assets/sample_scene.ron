@@ -1,0 +1,67 @@
+(
+    version: 2,
+    nodes: [
+        (
+            id: 1,
+            name: "start",
+            kind: GameplayEvent,
+            target: Cpu,
+            dependencies: [],
+            settings: {},
+            gpu_bindings: [],
+            compute: None,
+            fallback_policy: Cpu,
+            gpu_resource_states: [],
+            shader_entry: None,
+            shader_profile: None,
+        ),
+        (
+            id: 2,
+            name: "compute_particles",
+            kind: ComputePass,
+            target: Hybrid,
+            dependencies: [1],
+            settings: {
+                "shader": "particles.hlsl",
+                "write_resources": "particles_buffer",
+            },
+            gpu_bindings: [
+                (
+                    set: 0,
+                    binding: 0,
+                    resource: "particles_buffer",
+                ),
+            ],
+            compute: Some((x: 8, y: 8, z: 1)),
+            fallback_policy: Cpu,
+            gpu_resource_states: [
+                (
+                    resource: "particles_buffer",
+                    access: Write,
+                ),
+            ],
+            shader_entry: Some("cs_main"),
+            shader_profile: Some("cs_6_6"),
+        ),
+        (
+            id: 3,
+            name: "sprite_batch",
+            kind: RenderPass,
+            target: Gpu,
+            dependencies: [2],
+            settings: {
+                "sprite_count": "64",
+                "blend": "alpha",
+                "target_resource": "frame_color",
+                "target_width": "1920",
+                "target_height": "1080",
+            },
+            gpu_bindings: [],
+            compute: None,
+            fallback_policy: Cpu,
+            gpu_resource_states: [],
+            shader_entry: Some("vs_main"),
+            shader_profile: Some("ps_6_0"),
+        ),
+    ],
+)

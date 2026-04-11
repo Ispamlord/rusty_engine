@@ -1,0 +1,17 @@
+[package]
+name = "engine_editor_app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+eframe.workspace = true
+egui.workspace = true
+engine_app = { path = "../engine_app" }
+engine_assets = { path = "../engine_assets" }
+engine_core = { path = "../engine_core" }
+engine_editor = { path = "../engine_editor" }
+engine_nodes = { path = "../engine_nodes" }
+engine_render_api = { path = "../engine_render_api" }
+rfd = "0.15"
+thiserror.workspace = true

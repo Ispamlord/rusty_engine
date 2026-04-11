@@ -1,0 +1,18 @@
+[package]
+name = "engine_editor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bevy_ecs.workspace = true
+egui.workspace = true
+egui-snarl.workspace = true
+engine_assets = { path = "../engine_assets" }
+engine_core = { path = "../engine_core" }
+engine_nodes = { path = "../engine_nodes" }
+engine_render_api = { path = "../engine_render_api" }
+ron.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

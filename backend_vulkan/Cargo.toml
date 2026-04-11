@@ -1,0 +1,12 @@
+[package]
+name = "backend_vulkan"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+engine_core = { path = "../engine_core" }
+engine_render_api = { path = "../engine_render_api" }
+ash.workspace = true
+ash-window.workspace = true
+tracing.workspace = true

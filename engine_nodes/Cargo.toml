@@ -1,0 +1,13 @@
+[package]
+name = "engine_nodes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bevy_ecs.workspace = true
+engine_render_api = { path = "../engine_render_api" }
+ron.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

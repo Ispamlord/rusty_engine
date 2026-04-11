@@ -1,0 +1,143 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  cpu_fallback:
+    name: CPU Fallback (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libasound2-dev \
+            libudev-dev \
+            libx11-dev \
+            libxrandr-dev \
+            libxinerama-dev \
+            libxcursor-dev \
+            libxi-dev \
+            libwayland-dev \
+            libxkbcommon-dev \
+            libvulkan-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace --all-targets
+
+      - name: Smoke demo
+        run: cargo run -p engine_app --example bootstrap
+
+      - name: Editor app smoke
+        run: cargo run -p engine_editor_app -- --project . --scene assets/sample_scene.ron --smoke
+
+      - name: Perf regression harness
+        env:
+          PERF_MAX_AVG_FRAME_MS: "16.67"
+        run: cargo run -p engine_app --example perf_regression
+
+  proton_dx_advisory:
+    name: Proton DX Advisory (Linux)
+    if: vars.ENABLE_PROTON_CI == 'true'
+    continue-on-error: true
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mingw-w64 wine64
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Add Windows target
+        run: rustup target add x86_64-pc-windows-gnu
+
+      - name: Build Windows DX artifacts (advisory)
+        run: |
+          cargo build --release -p backend_dx11 --target x86_64-pc-windows-gnu
+          cargo build --release -p backend_dx12 --target x86_64-pc-windows-gnu
+          cargo build --release -p engine_app --example bootstrap --target x86_64-pc-windows-gnu
+
+      - name: Wine smoke (advisory)
+        run: |
+          if command -v wine >/dev/null 2>&1; then
+            wine target/x86_64-pc-windows-gnu/release/examples/bootstrap.exe || true
+          fi
+
+  gpu_vulkan_linux:
+    name: GPU Vulkan Smoke (Linux)
+    if: vars.ENABLE_GPU_CI == 'true'
+    runs-on: [self-hosted, linux, x64, gpu]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Vulkan smoke demo
+        run: cargo run -p engine_app --example bootstrap config/default.ron assets/sample_scene.ron
+
+      - name: Editor play-mode smoke
+        run: cargo run -p engine_editor_app -- --project . --scene assets/sample_scene.ron --smoke
+
+      - name: Performance smoke
+        env:
+          PERF_MAX_AVG_FRAME_MS: "16.67"
+        run: cargo run -p engine_app --example perf_regression
+
+  gpu_windows_dx:
+    name: GPU DX Smoke (Windows)
+    if: vars.ENABLE_GPU_CI == 'true'
+    runs-on: [self-hosted, windows, x64, gpu]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: DX12 smoke demo
+        run: cargo run -p engine_app --example bootstrap config/default.ron assets/sample_scene.ron
+
+      - name: Editor play-mode smoke
+        run: cargo run -p engine_editor_app -- --project . --scene assets/sample_scene.ron --smoke
+
+      - name: Performance smoke
+        env:
+          PERF_MAX_AVG_FRAME_MS: "16.67"
+        run: cargo run -p engine_app --example perf_regression
