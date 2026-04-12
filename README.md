@@ -60,6 +60,77 @@
 - `engine_editor_app`: dedicated visual-programming editor app (graph canvas, inspector, diagnostics, embedded play mode)
 - `engine_app`: runtime orchestration, phase scheduling, backend execution, recovery/hot-reload
 
+## Prerequisites
+
+### Windows
+
+Install these first:
+
+1. Rust toolchain (stable, MSVC target)
+   - Install `rustup` and run:
+
+```bash
+rustup default stable
+rustup target add x86_64-pc-windows-msvc
+```
+
+2. Visual C++ toolchain + Windows SDK
+   - Install Visual Studio 2022 Build Tools.
+   - Include workload: `Desktop development with C++`.
+   - Make sure a recent Windows SDK is selected.
+
+3. Git
+
+Optional, but recommended for full shader toolchain behavior:
+
+1. Vulkan SDK (for `glslc`)
+2. DirectX Shader Compiler (`dxc`)
+3. FXC (`fxc`, usually provided by Windows SDK)
+
+Windows notes:
+
+- Default config expects `glslc`, `dxc`, and `fxc` on `PATH`.
+- You can set explicit paths in `config/default.ron` under `shader_toolchain`.
+- Shader toolchain strict mode is disabled by default (`strict: false`), so missing compilers can fall back instead of failing hard.
+
+### Linux
+
+Install these first:
+
+1. Rust toolchain (stable)
+
+```bash
+rustup default stable
+```
+
+2. Git
+
+3. System dependencies (Ubuntu/Debian):
+
+```bash
+sudo apt-get update
+sudo apt-get install -y \
+  libasound2-dev \
+  libudev-dev \
+  libx11-dev \
+  libxrandr-dev \
+  libxinerama-dev \
+  libxcursor-dev \
+  libxi-dev \
+  libwayland-dev \
+  libxkbcommon-dev \
+  libvulkan-dev
+```
+
+Optional for full shader toolchain behavior:
+
+1. Vulkan SDK / `glslc`
+
+Linux notes:
+
+- Linux runtime backend is Vulkan.
+- If `glslc` is not found and strict mode remains disabled, shader compile can fall back instead of failing hard.
+
 ## Quick start
 
 1. Run checks:
