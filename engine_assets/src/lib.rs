@@ -13,6 +13,7 @@ use thiserror::Error;
 pub enum AssetKind {
     Texture,
     Audio,
+    Shape,
     Graph,
     Shader,
     Unknown,
@@ -351,6 +352,18 @@ pub fn parse_shader_metadata(source: &str) -> Result<ShaderMetadata, AssetError>
 }
 
 pub fn infer_asset_kind(path: &Path) -> AssetKind {
+    if path
+        .components()
+        .any(|component| component.as_os_str() == "basic_shapes")
+        && path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or_default()
+            .eq_ignore_ascii_case("ron")
+    {
+        return AssetKind::Shape;
+    }
+
     match path
         .extension()
         .and_then(|ext| ext.to_str())
@@ -592,6 +605,10 @@ mod tests {
         assert_eq!(
             infer_asset_kind(Path::new("sprite.png")),
             AssetKind::Texture
+        );
+        assert_eq!(
+            infer_asset_kind(Path::new("assets/basic_shapes/square.ron")),
+            AssetKind::Shape
         );
         assert_eq!(infer_asset_kind(Path::new("scene.ron")), AssetKind::Graph);
         assert_eq!(infer_asset_kind(Path::new("sound.ogg")), AssetKind::Audio);

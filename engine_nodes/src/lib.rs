@@ -24,6 +24,8 @@ pub enum NodeKind {
     GameplayFlow,
     GameplayEvent,
     MathState,
+    ScriptBehavior,
+    ObjectInitializer,
     RenderPass,
     ComputePass,
     AssetReference,
@@ -640,7 +642,10 @@ fn fallback_for_unsupported_gpu(
 
 fn phase_for_node_kind(kind: NodeKind) -> &'static str {
     match kind {
-        NodeKind::GameplayFlow | NodeKind::GameplayEvent => "gameplay",
+        NodeKind::GameplayFlow
+        | NodeKind::GameplayEvent
+        | NodeKind::ScriptBehavior
+        | NodeKind::ObjectInitializer => "gameplay",
         NodeKind::MathState => "math",
         NodeKind::RenderPass | NodeKind::ComputePass => "render",
         NodeKind::AssetReference => "asset",
@@ -702,11 +707,15 @@ fn track_usage(
 }
 
 fn make_placeholder_sprites(count: u32) -> Vec<SpriteInstance> {
+    let columns = (count.max(1) as f32).sqrt().ceil().max(1.0) as u32;
+    let rows = (count + columns - 1) / columns;
+    let spacing = 72.0;
+
     (0..count)
         .map(|index| SpriteInstance {
             texture: TextureHandle((index % 4) as u64),
-            x: (index % 100) as f32 * 8.0,
-            y: (index / 100) as f32 * 8.0,
+            x: ((index % columns) as f32 - (columns.saturating_sub(1) as f32 * 0.5)) * spacing,
+            y: ((index / columns) as f32 - (rows.saturating_sub(1) as f32 * 0.5)) * spacing,
             width: 32.0,
             height: 32.0,
             rotation_radians: 0.0,

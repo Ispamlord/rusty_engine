@@ -180,13 +180,19 @@ Headless startup smoke mode (for CI):
 cargo run -p engine_editor_app -- --project . --scene assets/sample_scene.ron --smoke
 ```
 
+Editor guide:
+
+- See [docs/editor_workflow.md](docs/editor_workflow.md) for the current project manager, workspace split, asset drag-and-drop, and node authoring flow.
+
 First-scene workflow:
 
 1. Launch editor from project root.
-2. Use graph canvas context menu to add nodes and connect compatible pins.
-3. Select a node to edit execution target/fallback in Inspector.
-4. Click `Hot Recompile` and use `Play` / `Stop` / `Step` controls.
-5. Save with `Save` or `Save As autosave_scene.ron`.
+2. Use the Project Manager to open or create a project before entering the editor.
+3. Switch between `Gameplay / Script` and `Render Pipeline` workspaces depending on the graph you want to edit.
+4. Drag assets from the Assets panel into the graph to create asset reference nodes, or right-click the canvas to add nodes manually.
+5. Select a node to edit execution target, fallback, and other node settings in Inspector.
+6. Click `Hot Recompile` and use `Play` / `Stop` / `Step` controls.
+7. Save with `Save` or `Save As autosave_scene.ron`.
 
 ## CI
 

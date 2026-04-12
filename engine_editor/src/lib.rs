@@ -61,6 +61,57 @@ pub enum PinTypeCategory {
     Event,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum EditorWorkspaceMode {
+    #[default]
+    Gameplay,
+    Render,
+}
+
+const GAMEPLAY_WORKSPACE_KINDS: &[NodeKind] = &[
+    NodeKind::GameplayEvent,
+    NodeKind::GameplayFlow,
+    NodeKind::MathState,
+    NodeKind::ScriptBehavior,
+    NodeKind::ObjectInitializer,
+    NodeKind::AssetReference,
+];
+
+const RENDER_WORKSPACE_KINDS: &[NodeKind] = &[
+    NodeKind::ComputePass,
+    NodeKind::RenderPass,
+    NodeKind::AssetReference,
+    NodeKind::BuildExport,
+];
+
+pub fn workspace_label(mode: EditorWorkspaceMode) -> &'static str {
+    match mode {
+        EditorWorkspaceMode::Gameplay => "Gameplay / Script",
+        EditorWorkspaceMode::Render => "Render Pipeline",
+    }
+}
+
+pub fn workspace_kinds(mode: EditorWorkspaceMode) -> &'static [NodeKind] {
+    match mode {
+        EditorWorkspaceMode::Gameplay => GAMEPLAY_WORKSPACE_KINDS,
+        EditorWorkspaceMode::Render => RENDER_WORKSPACE_KINDS,
+    }
+}
+
+pub fn node_workspace(kind: NodeKind) -> EditorWorkspaceMode {
+    match kind {
+        NodeKind::ComputePass | NodeKind::RenderPass | NodeKind::BuildExport => {
+            EditorWorkspaceMode::Render
+        }
+        NodeKind::GameplayFlow
+        | NodeKind::GameplayEvent
+        | NodeKind::MathState
+        | NodeKind::ScriptBehavior
+        | NodeKind::ObjectInitializer
+        | NodeKind::AssetReference => EditorWorkspaceMode::Gameplay,
+    }
+}
+
 pub fn pin_types_compatible(output: PinTypeCategory, input: PinTypeCategory) -> bool {
     matches!(
         (output, input),
@@ -81,6 +132,8 @@ pub fn node_output_pin_type(kind: NodeKind) -> PinTypeCategory {
         NodeKind::GameplayFlow => PinTypeCategory::Flow,
         NodeKind::GameplayEvent => PinTypeCategory::Event,
         NodeKind::MathState => PinTypeCategory::Data,
+        NodeKind::ScriptBehavior => PinTypeCategory::Flow,
+        NodeKind::ObjectInitializer => PinTypeCategory::Data,
         NodeKind::RenderPass | NodeKind::BuildExport => PinTypeCategory::Texture,
         NodeKind::ComputePass => PinTypeCategory::Buffer,
         NodeKind::AssetReference => PinTypeCategory::Data,
@@ -92,6 +145,8 @@ pub fn node_input_pin_type(kind: NodeKind) -> PinTypeCategory {
         NodeKind::GameplayFlow => PinTypeCategory::Flow,
         NodeKind::GameplayEvent => PinTypeCategory::Event,
         NodeKind::MathState => PinTypeCategory::Data,
+        NodeKind::ScriptBehavior => PinTypeCategory::Flow,
+        NodeKind::ObjectInitializer => PinTypeCategory::Data,
         NodeKind::RenderPass | NodeKind::BuildExport => PinTypeCategory::Texture,
         NodeKind::ComputePass => PinTypeCategory::Buffer,
         NodeKind::AssetReference => PinTypeCategory::Data,
@@ -130,6 +185,7 @@ pub struct ProjectAssetEntry {
 pub enum EditorAssetKind {
     Texture,
     Audio,
+    Shape,
     Graph,
     Shader,
     Unknown,
@@ -140,6 +196,7 @@ impl From<AssetKind> for EditorAssetKind {
         match value {
             AssetKind::Texture => Self::Texture,
             AssetKind::Audio => Self::Audio,
+            AssetKind::Shape => Self::Shape,
             AssetKind::Graph => Self::Graph,
             AssetKind::Shader => Self::Shader,
             AssetKind::Unknown => Self::Unknown,
@@ -386,6 +443,8 @@ pub struct EditorSessionState {
     pub viewport: EditorViewportState,
     pub history: HistoryGraph,
     pub diagnostics: Vec<String>,
+    #[serde(default)]
+    pub workspace_mode: EditorWorkspaceMode,
 }
 
 #[derive(Debug, Error)]
@@ -449,6 +508,7 @@ impl EditorProjectState {
                 viewport: EditorViewportState::default(),
                 history: HistoryGraph::new(document.clone()),
                 diagnostics: Vec::new(),
+                workspace_mode: EditorWorkspaceMode::default(),
             });
 
         if session.history.nodes.is_empty() {
@@ -506,7 +566,14 @@ impl EditorProjectState {
 
     pub fn refresh_asset_index(&mut self) -> Result<(), EditorError> {
         let mut files = Vec::new();
-        collect_files_recursive(&self.project_root, &mut files)?;
+        let asset_root = self.project_root.join("assets");
+        if asset_root.exists() {
+            collect_files_recursive(&asset_root, &mut files)?;
+        }
+
+        if self.scene_path.exists() && !files.contains(&self.scene_path) {
+            files.push(self.scene_path.clone());
+        }
         files.sort();
 
         self.asset_index = files
@@ -859,11 +926,19 @@ impl GraphCanvasState {
         }
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, next_node_id: &mut NodeId, selected: Option<NodeId>) -> GraphCanvasOutput {
+    pub fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        next_node_id: &mut NodeId,
+        selected: Option<NodeId>,
+        workspace_mode: EditorWorkspaceMode,
+        dragged_asset: Option<ProjectAssetEntry>,
+    ) -> GraphCanvasOutput {
         let mut viewer = ProjectSnarlViewer {
             commands: Vec::new(),
             selected_node: selected,
             next_node_id,
+            workspace_mode,
         };
         let style = SnarlStyle::new();
         self.snarl.show(&mut viewer, &style, "editor_graph_snarl", ui);
@@ -889,6 +964,27 @@ impl GraphCanvasState {
             }
         }
 
+        if let Some(asset) = dragged_asset {
+            let released = ui.ctx().input(|input| input.pointer.any_released());
+            let hover_pos = ui.ctx().input(|input| input.pointer.interact_pos());
+            if released && ui.rect_contains_pointer(ui.max_rect()) {
+                if let Some(pos) = hover_pos {
+                    let new_id = *next_node_id;
+                    *next_node_id += 1;
+                    let node = build_node_for_kind(new_id, NodeKind::AssetReference, Some(&asset));
+                    let snarl_node = self
+                        .snarl
+                        .insert_node(pos, SnarlVisualNode::from_node(&node));
+                    self.node_map.insert(node.id, snarl_node);
+                    self.last_positions.insert(node.id, [pos.x, pos.y]);
+                    output.commands.push(EditorCommand::AddNode {
+                        node,
+                        position: [pos.x, pos.y],
+                    });
+                }
+            }
+        }
+
         output
     }
 }
@@ -897,6 +993,7 @@ struct ProjectSnarlViewer<'a> {
     commands: Vec<EditorCommand>,
     selected_node: Option<NodeId>,
     next_node_id: &'a mut NodeId,
+    workspace_mode: EditorWorkspaceMode,
 }
 
 impl<'a> SnarlViewer<SnarlVisualNode> for ProjectSnarlViewer<'a> {
@@ -929,41 +1026,11 @@ impl<'a> SnarlViewer<SnarlVisualNode> for ProjectSnarlViewer<'a> {
     }
 
     fn show_graph_menu(&mut self, pos: egui::Pos2, ui: &mut egui::Ui, snarl: &mut Snarl<SnarlVisualNode>) {
-        for kind in [
-            NodeKind::GameplayEvent,
-            NodeKind::GameplayFlow,
-            NodeKind::MathState,
-            NodeKind::ComputePass,
-            NodeKind::RenderPass,
-            NodeKind::AssetReference,
-            NodeKind::BuildExport,
-        ] {
+        for kind in workspace_kinds(self.workspace_mode) {
             if ui.button(format!("Add {:?}", kind)).clicked() {
                 let new_id = *self.next_node_id;
                 *self.next_node_id += 1;
-
-                let node = Node {
-                    id: new_id,
-                    name: format!("{:?}_{new_id}", kind).to_ascii_lowercase(),
-                    kind,
-                    target: match kind {
-                        NodeKind::GameplayFlow | NodeKind::GameplayEvent | NodeKind::MathState => {
-                            NodeExecutionTarget::Cpu
-                        }
-                        NodeKind::ComputePass | NodeKind::RenderPass | NodeKind::BuildExport => {
-                            NodeExecutionTarget::Gpu
-                        }
-                        NodeKind::AssetReference => NodeExecutionTarget::Hybrid,
-                    },
-                    dependencies: Vec::new(),
-                    settings: BTreeMap::new(),
-                    gpu_bindings: Vec::new(),
-                    compute: None,
-                    fallback_policy: NodeFallbackPolicy::Cpu,
-                    gpu_resource_states: Vec::new(),
-                    shader_entry: None,
-                    shader_profile: None,
-                };
+                let node = build_node_for_kind(new_id, *kind, None);
 
                 snarl.insert_node(pos, SnarlVisualNode::from_node(&node));
                 self.commands.push(EditorCommand::AddNode {
@@ -1061,6 +1128,49 @@ impl<'a> SnarlViewer<SnarlVisualNode> for ProjectSnarlViewer<'a> {
     }
 }
 
+fn build_node_for_kind(
+    id: NodeId,
+    kind: NodeKind,
+    asset: Option<&ProjectAssetEntry>,
+) -> Node {
+    let mut node = Node {
+        id,
+        name: format!("{:?}_{id}", kind).to_ascii_lowercase(),
+        kind,
+        target: match kind {
+            NodeKind::GameplayFlow
+            | NodeKind::GameplayEvent
+            | NodeKind::MathState
+            | NodeKind::ScriptBehavior
+            | NodeKind::ObjectInitializer => NodeExecutionTarget::Cpu,
+            NodeKind::AssetReference => NodeExecutionTarget::Hybrid,
+            NodeKind::ComputePass | NodeKind::RenderPass | NodeKind::BuildExport => {
+                NodeExecutionTarget::Gpu
+            }
+        },
+        dependencies: Vec::new(),
+        settings: BTreeMap::new(),
+        gpu_bindings: Vec::new(),
+        compute: None,
+        fallback_policy: NodeFallbackPolicy::Cpu,
+        gpu_resource_states: Vec::new(),
+        shader_entry: None,
+        shader_profile: None,
+    };
+
+    if let Some(asset) = asset {
+        node.settings
+            .insert("asset_path".to_string(), asset.path.display().to_string());
+        node.settings
+            .insert("asset_kind".to_string(), format!("{:?}", asset.kind));
+        if let Some(stem) = asset.path.file_stem().and_then(|stem| stem.to_str()) {
+            node.name = stem.to_string();
+        }
+    }
+
+    node
+}
+
 pub fn sync_document_dependencies_from_snarl(document: &mut EditorDocument, snarl: &Snarl<SnarlVisualNode>) {
     let mut deps: BTreeMap<NodeId, BTreeSet<NodeId>> = BTreeMap::new();
 
@@ -1091,6 +1201,7 @@ pub fn apply_inspector_node_change(
     fallback: Option<NodeFallbackPolicy>,
     shader_entry: Option<Option<String>>,
     shader_profile: Option<Option<String>>,
+    setting_change: Option<(String, Option<String>)>,
 ) -> Result<(), EditorError> {
     let Some(node) = project.document.graph.nodes.iter().find(|node| node.id == node_id).cloned() else {
         return Ok(());
@@ -1139,6 +1250,18 @@ pub fn apply_inspector_node_change(
                 new_entry,
                 old_profile: node.shader_profile.clone(),
                 new_profile,
+            });
+        }
+    }
+
+    if let Some((key, new_value)) = setting_change {
+        let old_value = node.settings.get(&key).cloned();
+        if old_value != new_value {
+            commands.push(EditorCommand::SetNodeSetting {
+                node_id,
+                key,
+                old: old_value,
+                new: new_value,
             });
         }
     }
