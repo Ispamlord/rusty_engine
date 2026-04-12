@@ -25,7 +25,7 @@ use windows::Win32::Graphics::Direct3D12::{
 #[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory2, IDXGIAdapter1, IDXGIFactory4, DXGI_ADAPTER_FLAG_SOFTWARE,
-    DXGI_ERROR_NOT_FOUND,
+    DXGI_CREATE_FACTORY_FLAGS, DXGI_ERROR_NOT_FOUND,
 };
 #[cfg(target_os = "windows")]
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject, INFINITE};
@@ -198,7 +198,8 @@ impl GraphicsBackend for Dx12Backend {
 
         #[cfg(target_os = "windows")]
         {
-            let factory: IDXGIFactory4 = unsafe { CreateDXGIFactory2(0) }
+            let factory: IDXGIFactory4 =
+                unsafe { CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)) }
                 .map_err(|err| BackendError::Init(format!("CreateDXGIFactory2 failed: {err}")))?;
             let adapter = Self::pick_adapter(&factory)?;
 
