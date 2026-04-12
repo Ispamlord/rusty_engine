@@ -1,4 +1,7 @@
+use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -7,15 +10,16 @@ use backend_dx12::Dx12Backend;
 use backend_vulkan::VulkanBackend;
 use bevy_ecs::prelude::*;
 use engine_assets::{
-    load_node_graph, AssetBuildCache, AssetChange, AssetError, AssetHotReload, AssetKind,
-    ShaderCompileOptions, ShaderSourceKind, ShaderTarget,
+    load_node_graph, load_scene_document, AssetBuildCache, AssetChange, AssetError, AssetHotReload,
+    AssetKind, AudioEmitter, Collider2D, SceneComponents, SceneDocument, SceneObject,
+    ScriptBinding, ShaderCompileOptions, ShaderSourceKind, ShaderTarget, Sprite2D, Transform2D,
 };
 use engine_audio::{audio_sync_system, AudioRuntime, AudioState};
 use engine_core::{load_config_from_ron, BackendPreference, EngineConfig, EngineCoreError};
 use engine_editor::{draw_overlay, EditorState, FrameTimings};
 use engine_nodes::{
-    compile_graph, CompileDiagnostic, CompiledGraphArtifact, EcsJobDescriptor, NodeCompileError,
-    NodeCompileOptions, NodeGraph,
+    compile_graph, CompileDiagnostic, CompiledGraphArtifact, DiagnosticAnchor, EcsJobDescriptor,
+    NodeCompileError, NodeCompileOptions, NodeGraph, ScriptJobDescriptor,
 };
 use engine_physics::{physics_sync_system, PhysicsWorld};
 use engine_platform::{
@@ -24,8 +28,9 @@ use engine_platform::{
 use engine_render_api::{
     BackendCapabilities, BackendDiagnosticEvent, BackendDiagnosticLevel, BackendDiagnostics,
     BackendError, BackendKind, GraphicsBackend, RenderGraph, RenderGraphPass, SurfaceConfig,
-    SurfaceHandle, SurfaceWindowHandles,
+    SurfaceHandle, SurfaceWindowHandles, ViewportReadback,
 };
+use rhai::{Dynamic, Engine as RhaiEngine, Scope, AST};
 use thiserror::Error;
 use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::window::Window;
@@ -37,11 +42,14 @@ pub struct ViewportFrame {
     pub width: u32,
     pub height: u32,
     pub texture_id: Option<u64>,
+    pub rgba8: Option<Vec<u8>>,
+    pub source: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeDiagnosticsSnapshot {
     pub compile_diagnostics: Vec<CompileDiagnostic>,
+    pub diagnostic_anchors: Vec<DiagnosticAnchor>,
     pub backend_diagnostics: BackendDiagnostics,
     pub frame_timings: FrameTimings,
     pub telemetry: FallbackTelemetry,
@@ -58,6 +66,284 @@ struct GraphRuntimeState {
 
 #[derive(Resource, Default)]
 struct FrameCounter(pub u64);
+
+#[derive(Debug, Clone, Default)]
+struct ScriptHostState {
+    scene: Option<SceneDocument>,
+    events: Vec<String>,
+    logs: Vec<String>,
+    next_object_id: u64,
+}
+
+struct ScriptRuntime {
+    engine: RhaiEngine,
+    ast_cache: HashMap<PathBuf, AST>,
+    host_state: Arc<Mutex<ScriptHostState>>,
+}
+
+impl ScriptHostState {
+    fn scene_mut(&mut self) -> Option<&mut SceneDocument> {
+        self.scene.as_mut()
+    }
+
+    fn with_object_mut<F>(&mut self, object_id: u64, mut update: F)
+    where
+        F: FnMut(&mut SceneObject),
+    {
+        if let Some(scene) = self.scene_mut() {
+            if let Some(object) = scene
+                .objects
+                .iter_mut()
+                .find(|object| object.object_id == object_id)
+            {
+                update(object);
+            }
+        }
+    }
+}
+
+impl ScriptRuntime {
+    fn new() -> Self {
+        let host_state = Arc::new(Mutex::new(ScriptHostState {
+            scene: None,
+            events: Vec::new(),
+            logs: Vec::new(),
+            next_object_id: 1000,
+        }));
+
+        let mut engine = RhaiEngine::new();
+
+        {
+            let host = host_state.clone();
+            engine.on_print(move |message| {
+                if let Ok(mut state) = host.lock() {
+                    state.logs.push(message.to_string());
+                }
+            });
+        }
+
+        {
+            let host = host_state.clone();
+            engine.register_fn("spawn_object", move |name: &str| -> i64 {
+                let Ok(mut state) = host.lock() else {
+                    return -1;
+                };
+                let next_id = if state.next_object_id == 0 {
+                    1000
+                } else {
+                    state.next_object_id
+                };
+                state.next_object_id = next_id.saturating_add(1);
+                let object = SceneObject {
+                    object_id: next_id,
+                    parent: None,
+                    layer_id: 1,
+                    name: name.to_string(),
+                    tags: Vec::new(),
+                    components: SceneComponents::default(),
+                };
+                if let Some(scene) = state.scene_mut() {
+                    scene.objects.push(object);
+                }
+                next_id as i64
+            });
+        }
+
+        {
+            let host = host_state.clone();
+            engine.register_fn("despawn_object", move |id: i64| {
+                if let Ok(mut state) = host.lock() {
+                    if let Some(scene) = state.scene_mut() {
+                        scene.objects.retain(|object| object.object_id != id as u64);
+                    }
+                }
+            });
+        }
+
+        {
+            let host = host_state.clone();
+            engine.register_fn(
+                "set_transform",
+                move |id: i64, x: f32, y: f32, rot: f32, sx: f32, sy: f32| {
+                    if let Ok(mut state) = host.lock() {
+                        state.with_object_mut(id as u64, |object| {
+                            object.components.transform = Transform2D {
+                                x,
+                                y,
+                                rotation_radians: rot,
+                                scale_x: sx,
+                                scale_y: sy,
+                            };
+                        });
+                    }
+                },
+            );
+        }
+
+        {
+            let host = host_state.clone();
+            engine.register_fn(
+                "set_sprite",
+                move |id: i64, texture: &str, width: i64, height: i64| {
+                    if let Ok(mut state) = host.lock() {
+                        state.with_object_mut(id as u64, |object| {
+                            object.components.sprite = Some(Sprite2D {
+                                texture_asset: texture.to_string(),
+                                width: width.max(1) as u32,
+                                height: height.max(1) as u32,
+                                tint_rgba: [255, 255, 255, 255],
+                                layer_order: 0,
+                            });
+                        });
+                    }
+                },
+            );
+        }
+
+        {
+            let host = host_state.clone();
+            engine.register_fn("set_custom", move |id: i64, key: &str, value: &str| {
+                if let Ok(mut state) = host.lock() {
+                    state.with_object_mut(id as u64, |object| {
+                        object
+                            .components
+                            .custom_properties
+                            .insert(key.to_string(), value.to_string());
+                    });
+                }
+            });
+        }
+
+        {
+            let host = host_state.clone();
+            engine.register_fn("emit_event", move |name: &str, payload: &str| {
+                if let Ok(mut state) = host.lock() {
+                    state.events.push(format!("{name}:{payload}"));
+                }
+            });
+        }
+
+        {
+            let host = host_state.clone();
+            engine.register_fn("set_audio", move |id: i64, asset: &str, volume: f32| {
+                if let Ok(mut state) = host.lock() {
+                    state.with_object_mut(id as u64, |object| {
+                        object.components.audio = Some(AudioEmitter {
+                            asset: asset.to_string(),
+                            volume,
+                            looping: false,
+                            spatial_blend: 0.0,
+                        });
+                    });
+                }
+            });
+        }
+
+        {
+            let host = host_state.clone();
+            engine.register_fn("set_collider_radius", move |id: i64, radius: f32| {
+                if let Ok(mut state) = host.lock() {
+                    state.with_object_mut(id as u64, |object| {
+                        object.components.collider = Some(Collider2D {
+                            shape: "circle".to_string(),
+                            radius,
+                            width: radius * 2.0,
+                            height: radius * 2.0,
+                            is_sensor: false,
+                        });
+                    });
+                }
+            });
+        }
+
+        {
+            let host = host_state.clone();
+            engine.register_fn(
+                "set_script",
+                move |id: i64, script_asset: &str, entry: &str, frame_phase: &str| {
+                    if let Ok(mut state) = host.lock() {
+                        state.with_object_mut(id as u64, |object| {
+                            object.components.script = Some(ScriptBinding {
+                                script_asset: script_asset.to_string(),
+                                entry: entry.to_string(),
+                                frame_phase: frame_phase.to_string(),
+                            });
+                        });
+                    }
+                },
+            );
+        }
+
+        {
+            let host = host_state.clone();
+            engine.register_fn("object_count", move || -> i64 {
+                let Ok(state) = host.lock() else {
+                    return 0;
+                };
+                state
+                    .scene
+                    .as_ref()
+                    .map(|scene| scene.objects.len() as i64)
+                    .unwrap_or(0)
+            });
+        }
+
+        Self {
+            engine,
+            ast_cache: HashMap::new(),
+            host_state,
+        }
+    }
+
+    fn set_scene(&mut self, scene: Option<SceneDocument>) {
+        if let Ok(mut state) = self.host_state.lock() {
+            state.scene = scene;
+        }
+    }
+
+    fn take_scene(&self) -> Option<SceneDocument> {
+        self.host_state
+            .lock()
+            .ok()
+            .and_then(|state| state.scene.clone())
+    }
+
+    fn execute_jobs(&mut self, jobs: &[ScriptJobDescriptor]) -> Result<(), EngineAppError> {
+        for job in jobs {
+            let script_path = PathBuf::from(&job.script_asset);
+            let ast = if let Some(cached) = self.ast_cache.get(&script_path) {
+                cached.clone()
+            } else {
+                let source = fs::read_to_string(&script_path).map_err(|err| {
+                    EngineAppError::Runtime(format!(
+                        "failed to read script {}: {err}",
+                        script_path.display()
+                    ))
+                })?;
+                let compiled = self.engine.compile(&source).map_err(|err| {
+                    EngineAppError::Runtime(format!("script compile error: {err}"))
+                })?;
+                self.ast_cache.insert(script_path.clone(), compiled.clone());
+                compiled
+            };
+
+            let mut scope = Scope::new();
+            scope.push("node_id", job.node_id as i64);
+            scope.push("node_name", job.node_name.clone());
+            scope.push("frame_phase", job.frame_phase.clone());
+
+            let _ = self
+                .engine
+                .call_fn::<Dynamic>(&mut scope, &ast, &job.entry, ())
+                .map_err(|err| EngineAppError::Runtime(format!("script runtime error: {err}")))?;
+        }
+        Ok(())
+    }
+
+    fn invalidate_script(&mut self, script_path: &Path) {
+        self.ast_cache.remove(script_path);
+    }
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FallbackTelemetry {
@@ -109,6 +395,9 @@ pub enum EngineAppError {
 
     #[error("backend recovery failed after {0} attempts")]
     RecoveryAttemptsExceeded(u32),
+
+    #[error("runtime error: {0}")]
+    Runtime(String),
 }
 
 pub struct EngineApp {
@@ -128,7 +417,9 @@ pub struct EngineApp {
     build_cache: AssetBuildCache,
     scene_path: Option<PathBuf>,
     scene_graph: Option<NodeGraph>,
+    current_scene: Option<SceneDocument>,
     compiled_graph: Option<CompiledGraphArtifact>,
+    last_viewport_readback: Option<ViewportReadback>,
 
     editor_state: EditorState,
     frame_timings: FrameTimings,
@@ -141,6 +432,7 @@ pub struct EngineApp {
     recovery_attempts: u32,
     telemetry: FallbackTelemetry,
     is_play_mode: bool,
+    script_runtime: ScriptRuntime,
 
     #[allow(dead_code)]
     audio_runtime: AudioRuntime,
@@ -185,6 +477,7 @@ impl EngineApp {
         audio_schedule.add_systems(audio_sync_system);
 
         let backend_diagnostics = backend.diagnostics();
+        let script_runtime = ScriptRuntime::new();
 
         Ok(Self {
             config,
@@ -201,7 +494,9 @@ impl EngineApp {
             build_cache: AssetBuildCache::new(),
             scene_path: None,
             scene_graph: None,
+            current_scene: None,
             compiled_graph: None,
+            last_viewport_readback: None,
             editor_state: EditorState::default(),
             frame_timings: FrameTimings::default(),
             backend_diagnostics,
@@ -212,6 +507,7 @@ impl EngineApp {
             recovery_attempts: 0,
             telemetry: FallbackTelemetry::default(),
             is_play_mode: false,
+            script_runtime,
             audio_runtime,
         })
     }
@@ -240,7 +536,15 @@ impl EngineApp {
     }
 
     pub fn set_active_scene_graph(&mut self, graph: NodeGraph) -> Result<bool, EngineAppError> {
-        self.compile_and_apply_graph(graph)
+        let scene = SceneDocument::from_graph(graph);
+        self.set_active_scene(scene)
+    }
+
+    pub fn set_active_scene(&mut self, scene: SceneDocument) -> Result<bool, EngineAppError> {
+        self.current_scene = Some(scene.clone());
+        self.scene_graph = Some(scene.graph.clone());
+        self.script_runtime.set_scene(Some(scene.clone()));
+        self.compile_and_apply_graph(scene.graph)
     }
 
     pub fn viewport_frame(&self) -> ViewportFrame {
@@ -250,11 +554,26 @@ impl EngineApp {
             .map(|counter| counter.0)
             .unwrap_or(0);
 
+        let (width, height) = self
+            .last_viewport_readback
+            .as_ref()
+            .map(|readback| (readback.width, readback.height))
+            .unwrap_or((self.config.window.width, self.config.window.height));
+
         ViewportFrame {
             frame_index,
-            width: self.config.window.width,
-            height: self.config.window.height,
+            width,
+            height,
             texture_id: None,
+            rgba8: self
+                .last_viewport_readback
+                .as_ref()
+                .map(|readback| readback.rgba8.clone()),
+            source: if self.last_viewport_readback.is_some() {
+                "backend_readback".to_string()
+            } else {
+                "none".to_string()
+            },
         }
     }
 
@@ -267,6 +586,11 @@ impl EngineApp {
 
         RuntimeDiagnosticsSnapshot {
             compile_diagnostics,
+            diagnostic_anchors: self
+                .compiled_graph
+                .as_ref()
+                .map(|artifact| artifact.diagnostic_anchors.clone())
+                .unwrap_or_default(),
             backend_diagnostics: self.backend_diagnostics.clone(),
             frame_timings: self.frame_timings.clone(),
             telemetry: self.telemetry.clone(),
@@ -297,8 +621,13 @@ impl EngineApp {
 
     pub fn load_scene(&mut self, path: impl AsRef<Path>) -> Result<(), EngineAppError> {
         let scene_path = path.as_ref().to_path_buf();
-        let graph = load_node_graph(&scene_path)?;
-        let compiled = self.compile_and_apply_graph(graph)?;
+        let compiled = match load_scene_document(&scene_path) {
+            Ok(scene) => self.set_active_scene(scene)?,
+            Err(_) => {
+                let graph = load_node_graph(&scene_path)?;
+                self.set_active_scene_graph(graph)?
+            }
+        };
         if !compiled {
             self.push_backend_event(
                 BackendDiagnosticLevel::Warning,
@@ -377,7 +706,7 @@ impl EngineApp {
 
         self.run_input_phase();
         self.run_fixed_update_phase(delta);
-        self.run_gameplay_phase();
+        self.run_gameplay_phase()?;
         self.run_audio_phase();
         self.run_render_phase()?;
 
@@ -429,10 +758,17 @@ impl EngineApp {
         }
     }
 
-    fn run_gameplay_phase(&mut self) {
+    fn run_gameplay_phase(&mut self) -> Result<(), EngineAppError> {
         if self.is_play_mode {
             self.gameplay_schedule.run(&mut self.world);
+            if let Some(artifact) = &self.compiled_graph {
+                self.script_runtime.execute_jobs(&artifact.script_jobs)?;
+                if let Some(scene) = self.script_runtime.take_scene() {
+                    self.current_scene = Some(scene);
+                }
+            }
         }
+        Ok(())
     }
 
     fn run_audio_phase(&mut self) {
@@ -456,6 +792,19 @@ impl EngineApp {
 
         self.backend.submit(frame)?;
         self.backend.present(frame)?;
+        match self.backend.readback_viewport() {
+            Ok(readback) => {
+                self.last_viewport_readback = readback;
+            }
+            Err(err) => {
+                self.push_backend_event(
+                    BackendDiagnosticLevel::Warning,
+                    Some(frame.0),
+                    None,
+                    format!("viewport readback failed: {err}"),
+                );
+            }
+        }
         Ok(())
     }
 
@@ -599,7 +948,11 @@ impl EngineApp {
             runtime_state.jobs = artifact.ecs_jobs.clone();
         }
 
-        self.scene_graph = Some(graph);
+        self.scene_graph = Some(graph.clone());
+        if let Some(scene) = self.current_scene.as_mut() {
+            scene.graph = graph;
+            self.script_runtime.set_scene(Some(scene.clone()));
+        }
         self.compiled_graph = Some(artifact);
         self.editor_state
             .mark_graph_compiled(self.telemetry.compile_fallback_events as usize);
@@ -651,6 +1004,21 @@ impl EngineApp {
         change: &AssetChange,
         report: &mut HotReloadReport,
     ) -> Result<(), EngineAppError> {
+        if change
+            .path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("rhai"))
+        {
+            self.script_runtime.invalidate_script(&change.path);
+            self.push_backend_event(
+                BackendDiagnosticLevel::Info,
+                None,
+                None,
+                format!("script cache invalidated for {}", change.path.display()),
+            );
+        }
+
         if matches!(change.kind, AssetKind::Shader) {
             self.build_cache.invalidate(&change.path);
             let source_kind = shader_source_kind(&change.path).unwrap_or(ShaderSourceKind::Hlsl);
@@ -686,9 +1054,17 @@ impl EngineApp {
         if matches!(change.kind, AssetKind::Graph) {
             if let Some(scene_path) = &self.scene_path {
                 if *scene_path == change.path {
-                    let graph = load_node_graph(scene_path)?;
-                    let recompiled = self.compile_and_apply_graph(graph)?;
-                    report.scene_recompiled = recompiled;
+                    match load_scene_document(scene_path) {
+                        Ok(scene) => {
+                            let recompiled = self.set_active_scene(scene)?;
+                            report.scene_recompiled = recompiled;
+                        }
+                        Err(_) => {
+                            let graph = load_node_graph(scene_path)?;
+                            let recompiled = self.compile_and_apply_graph(graph)?;
+                            report.scene_recompiled = recompiled;
+                        }
+                    }
                 }
             }
         }
@@ -840,7 +1216,7 @@ mod tests {
     use engine_assets::save_node_graph;
     use engine_nodes::{
         ComputeDispatchConfig, GpuResourceAccess, Node, NodeExecutionTarget, NodeFallbackPolicy,
-        NodeGraph, NodeKind,
+        NodeGraph, NodeKind, NodePayload,
     };
     use std::collections::BTreeMap;
 
@@ -861,6 +1237,7 @@ mod tests {
                     gpu_resource_states: vec![],
                     shader_entry: None,
                     shader_profile: None,
+                    payload: Some(NodePayload::GameplayEvent(Default::default())),
                 },
                 Node {
                     id: 2,
@@ -884,6 +1261,7 @@ mod tests {
                     }],
                     shader_entry: Some("cs_main".to_string()),
                     shader_profile: Some("cs_6_6".to_string()),
+                    payload: Some(NodePayload::ComputePass(Default::default())),
                 },
                 Node {
                     id: 3,
@@ -901,6 +1279,7 @@ mod tests {
                     gpu_resource_states: vec![],
                     shader_entry: Some("vs_main".to_string()),
                     shader_profile: Some("ps_6_0".to_string()),
+                    payload: Some(NodePayload::RenderPass(Default::default())),
                 },
             ],
         }
@@ -967,6 +1346,7 @@ mod tests {
             gpu_resource_states: vec![],
             shader_entry: None,
             shader_profile: None,
+            payload: Some(NodePayload::BuildExport(Default::default())),
         });
 
         save_node_graph(&scene_path, &graph_b).expect("graph should save");

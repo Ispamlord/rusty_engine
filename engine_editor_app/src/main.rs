@@ -59,7 +59,7 @@ fn parse_cli_args(args: impl IntoIterator<Item = String>) -> Result<CliArgs, Str
 
 fn print_help() {
     println!(
-        "Rusty Engine Editor\n\nUsage:\n  cargo run -p engine_editor_app -- [project_path] [--project <path>] [--scene <path>] [--smoke]\n\nOptions:\n  --project <path>  Project root directory\n  --scene <path>    Scene graph file to open\n  --smoke           Headless startup smoke mode\n  -h, --help        Show this message"
+        "Rusty Engine Editor\n\nUsage:\n  cargo run -p engine_editor_app -- [project_path] [--project <path>] [--scene <path>] [--smoke]\n\nOptions:\n  --project <path>  Project root directory\n  --scene <path>    Scene file to open (.scene.ron)\n  --smoke           Headless startup smoke mode\n  -h, --help        Show this message"
     );
 }
 
@@ -69,7 +69,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
     })?;
 
-    let project_path = args.project.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let project_path = args
+        .project
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
     let mut app = EditorApp::new(project_path, EditorAppConfig::default())?;
 

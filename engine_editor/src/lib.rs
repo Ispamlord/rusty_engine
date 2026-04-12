@@ -4,10 +4,15 @@ use std::path::{Path, PathBuf};
 
 use egui_snarl::ui::{PinInfo, SnarlStyle, SnarlViewer};
 use egui_snarl::{InPin, NodeId as SnarlNodeId, OutPin, Snarl};
-use engine_assets::{infer_asset_kind, load_node_graph, save_node_graph, AssetKind};
+use engine_assets::{
+    infer_asset_kind, load_scene_document, save_scene_document, AssetError, AssetKind,
+    Camera2DComponent, Collider2D, SceneDocument, SceneLayer, SceneObject, Sprite2D, Transform2D,
+};
 use engine_nodes::{
-    CompileDiagnostic, Node, NodeExecutionTarget, NodeFallbackPolicy, NodeGraph, NodeId, NodeKind,
-    CURRENT_GRAPH_VERSION,
+    AssetReferencePayload, BuildExportPayload, CompileDiagnostic, ComputePassPayload,
+    GameplayEventPayload, GameplayFlowPayload, MathStatePayload, Node, NodeExecutionTarget,
+    NodeFallbackPolicy, NodeGraph, NodeId, NodeKind, NodePayload, ObjectInitializerPayload,
+    RenderPassPayload, ScriptBehaviorPayload, CURRENT_GRAPH_VERSION,
 };
 use engine_render_api::{
     BackendCapabilities, BackendDiagnosticLevel, BackendDiagnostics, BackendKind,
@@ -155,23 +160,27 @@ pub fn node_input_pin_type(kind: NodeKind) -> PinTypeCategory {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EditorDocument {
-    pub graph: NodeGraph,
+    pub scene: SceneDocument,
     pub node_positions: BTreeMap<NodeId, [f32; 2]>,
 }
 
 impl EditorDocument {
-    pub fn from_graph(graph: NodeGraph) -> Self {
+    pub fn from_scene(scene: SceneDocument) -> Self {
         let mut node_positions = BTreeMap::new();
-        for (index, node) in graph.nodes.iter().enumerate() {
+        for (index, node) in scene.graph.nodes.iter().enumerate() {
             let x = 80.0 + (index as f32 % 6.0) * 220.0;
             let y = 80.0 + (index as f32 / 6.0).floor() * 140.0;
             node_positions.insert(node.id, [x, y]);
         }
 
         Self {
-            graph,
+            scene,
             node_positions,
         }
+    }
+
+    pub fn from_graph(graph: NodeGraph) -> Self {
+        Self::from_scene(SceneDocument::from_graph(graph))
     }
 }
 
@@ -271,6 +280,71 @@ pub enum EditorCommand {
     },
     SetNodeSetting {
         node_id: NodeId,
+        key: String,
+        old: Option<String>,
+        new: Option<String>,
+    },
+    AddLayer {
+        layer: SceneLayer,
+    },
+    RemoveLayer {
+        layer: SceneLayer,
+        removed_objects: Vec<SceneObject>,
+    },
+    SetLayerProps {
+        layer_id: u64,
+        old_name: String,
+        new_name: String,
+        old_order: i32,
+        new_order: i32,
+        old_visible: bool,
+        new_visible: bool,
+        old_locked: bool,
+        new_locked: bool,
+    },
+    AddObject {
+        object: SceneObject,
+    },
+    RemoveObject {
+        object: SceneObject,
+    },
+    ReparentObject {
+        object_id: u64,
+        old_parent: Option<u64>,
+        new_parent: Option<u64>,
+    },
+    MoveObjectToLayer {
+        object_id: u64,
+        old_layer: u64,
+        new_layer: u64,
+    },
+    SetObjectName {
+        object_id: u64,
+        old_name: String,
+        new_name: String,
+    },
+    SetObjectTransform {
+        object_id: u64,
+        old: Transform2D,
+        new: Transform2D,
+    },
+    SetObjectSprite {
+        object_id: u64,
+        old: Option<Sprite2D>,
+        new: Option<Sprite2D>,
+    },
+    SetObjectCollider {
+        object_id: u64,
+        old: Option<Collider2D>,
+        new: Option<Collider2D>,
+    },
+    SetObjectCamera {
+        object_id: u64,
+        old: Option<Camera2DComponent>,
+        new: Option<Camera2DComponent>,
+    },
+    SetObjectCustom {
+        object_id: u64,
         key: String,
         old: Option<String>,
         new: Option<String>,
@@ -453,7 +527,10 @@ pub enum EditorError {
     Io(#[from] std::io::Error),
 
     #[error("asset error: {0}")]
-    Asset(#[from] engine_assets::AssetError),
+    Asset(#[from] AssetError),
+
+    #[error("legacy graph-only files are not editable in the scene editor; convert to .scene.ron")]
+    LegacySceneFormat,
 
     #[error("session parse error: {0}")]
     SessionParse(String),
@@ -474,24 +551,37 @@ pub struct EditorProjectState {
     pub asset_index: Vec<ProjectAssetEntry>,
     pub session: EditorSessionState,
     pub next_node_id: NodeId,
+    pub next_layer_id: u64,
+    pub next_object_id: u64,
 }
 
 impl EditorProjectState {
-    pub fn open(project_root: impl AsRef<Path>, scene_override: Option<PathBuf>) -> Result<Self, EditorError> {
+    pub fn open(
+        project_root: impl AsRef<Path>,
+        scene_override: Option<PathBuf>,
+    ) -> Result<Self, EditorError> {
         let project_root = project_root.as_ref().to_path_buf();
         fs::create_dir_all(&project_root)?;
 
-        let scene_path = scene_override.unwrap_or_else(|| project_root.join("assets/sample_scene.ron"));
+        let scene_path =
+            scene_override.unwrap_or_else(|| project_root.join("assets/sample_scene.scene.ron"));
         if !scene_path.exists() {
             if let Some(parent) = scene_path.parent() {
                 fs::create_dir_all(parent)?;
             }
-            save_node_graph(&scene_path, &NodeGraph::empty())?;
+            save_scene_document(&scene_path, &SceneDocument::new_default())?;
         }
 
-        let graph = load_node_graph(&scene_path)?;
-        let document = EditorDocument::from_graph(graph);
+        let scene = match load_scene_document(&scene_path) {
+            Ok(scene) => scene,
+            Err(AssetError::LegacyGraphFormat) => {
+                return Err(EditorError::LegacySceneFormat);
+            }
+            Err(err) => return Err(EditorError::Asset(err)),
+        };
+        let document = EditorDocument::from_scene(scene);
         let next_node_id = document
+            .scene
             .graph
             .nodes
             .iter()
@@ -499,9 +589,26 @@ impl EditorProjectState {
             .max()
             .unwrap_or(0)
             + 1;
+        let next_layer_id = document
+            .scene
+            .layers
+            .iter()
+            .map(|layer| layer.layer_id)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let next_object_id = document
+            .scene
+            .objects
+            .iter()
+            .map(|object| object.object_id)
+            .max()
+            .unwrap_or(0)
+            + 1;
 
-        let mut session = load_session(&project_root)?
-            .unwrap_or_else(|| EditorSessionState {
+        let mut session = match load_session(&project_root) {
+            Ok(Some(session)) => session,
+            Ok(None) | Err(EditorError::SessionParse(_)) => EditorSessionState {
                 selected_node: None,
                 selected_asset: None,
                 recent_projects: vec![project_root.clone()],
@@ -509,7 +616,9 @@ impl EditorProjectState {
                 history: HistoryGraph::new(document.clone()),
                 diagnostics: Vec::new(),
                 workspace_mode: EditorWorkspaceMode::default(),
-            });
+            },
+            Err(err) => return Err(err),
+        };
 
         if session.history.nodes.is_empty() {
             session.history = HistoryGraph::new(document.clone());
@@ -530,6 +639,8 @@ impl EditorProjectState {
             asset_index: Vec::new(),
             session,
             next_node_id,
+            next_layer_id,
+            next_object_id,
         };
 
         project.refresh_asset_index()?;
@@ -537,7 +648,7 @@ impl EditorProjectState {
     }
 
     pub fn save_scene(&mut self) -> Result<(), EditorError> {
-        save_node_graph(&self.scene_path, &self.document.graph)?;
+        save_scene_document(&self.scene_path, &self.document.scene)?;
         self.dirty = false;
         self.persist_session()?;
         Ok(())
@@ -545,7 +656,7 @@ impl EditorProjectState {
 
     pub fn save_scene_as(&mut self, path: impl AsRef<Path>) -> Result<(), EditorError> {
         self.scene_path = path.as_ref().to_path_buf();
-        save_node_graph(&self.scene_path, &self.document.graph)?;
+        save_scene_document(&self.scene_path, &self.document.scene)?;
         self.dirty = false;
         self.persist_session()?;
         Ok(())
@@ -556,11 +667,13 @@ impl EditorProjectState {
             return Ok(());
         }
 
-        let autosave_path = self.project_root.join(".rusty_engine/editor_autosave.ron");
+        let autosave_path = self
+            .project_root
+            .join(".rusty_engine/editor_autosave.scene.ron");
         if let Some(parent) = autosave_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        save_node_graph(autosave_path, &self.document.graph)?;
+        save_scene_document(autosave_path, &self.document.scene)?;
         Ok(())
     }
 
@@ -612,11 +725,9 @@ impl EditorProjectState {
         self.document = updated.clone();
         self.dirty = true;
 
-        self.session.history.record(
-            label,
-            EditorCommand::Batch { commands },
-            updated,
-        );
+        self.session
+            .history
+            .record(label, EditorCommand::Batch { commands }, updated);
 
         self.persist_session()?;
         Ok(())
@@ -671,40 +782,94 @@ impl EditorProjectState {
     }
 
     pub fn remove_node_command(&self, node_id: NodeId) -> Option<EditorCommand> {
-        let node = self.document.graph.nodes.iter().find(|node| node.id == node_id)?.clone();
+        let node = self
+            .document
+            .scene
+            .graph
+            .nodes
+            .iter()
+            .find(|node| node.id == node_id)?
+            .clone();
         let position = self.document.node_positions.get(&node_id).copied();
         Some(EditorCommand::RemoveNode { node, position })
     }
+
+    pub fn allocate_layer_id(&mut self) -> u64 {
+        let id = self.next_layer_id;
+        self.next_layer_id += 1;
+        id
+    }
+
+    pub fn allocate_object_id(&mut self) -> u64 {
+        let id = self.next_object_id;
+        self.next_object_id += 1;
+        id
+    }
+
+    pub fn default_layer_id(&self) -> u64 {
+        self.document
+            .scene
+            .layers
+            .iter()
+            .min_by_key(|layer| layer.order)
+            .map(|layer| layer.layer_id)
+            .unwrap_or(1)
+    }
+
+    pub fn autosave_path(&self) -> PathBuf {
+        self.project_root
+            .join(".rusty_engine/editor_autosave.scene.ron")
+    }
 }
 
-fn apply_command_internal(document: &mut EditorDocument, command: &EditorCommand) -> Result<(), EditorError> {
+fn apply_command_internal(
+    document: &mut EditorDocument,
+    command: &EditorCommand,
+) -> Result<(), EditorError> {
     match command {
         EditorCommand::AddNode { node, position } => {
-            if document.graph.nodes.iter().any(|existing| existing.id == node.id) {
-                return Err(EditorError::Command(format!("duplicate node id {}", node.id)));
+            if document
+                .scene
+                .graph
+                .nodes
+                .iter()
+                .any(|existing| existing.id == node.id)
+            {
+                return Err(EditorError::Command(format!(
+                    "duplicate node id {}",
+                    node.id
+                )));
             }
-            document.graph.nodes.push(node.clone());
+            document.scene.graph.nodes.push(node.clone());
             document.node_positions.insert(node.id, *position);
         }
         EditorCommand::RemoveNode { node, .. } => {
-            document.graph.nodes.retain(|existing| existing.id != node.id);
+            document
+                .scene
+                .graph
+                .nodes
+                .retain(|existing| existing.id != node.id);
             document.node_positions.remove(&node.id);
-            for existing in &mut document.graph.nodes {
+            for existing in &mut document.scene.graph.nodes {
                 existing.dependencies.retain(|dep| *dep != node.id);
             }
         }
         EditorCommand::ConnectNodes { from, to } => {
             if from == to {
-                return Err(EditorError::Command("cannot connect node to itself".to_string()));
+                return Err(EditorError::Command(
+                    "cannot connect node to itself".to_string(),
+                ));
             }
 
             let out_node = document
+                .scene
                 .graph
                 .nodes
                 .iter()
                 .find(|node| node.id == *from)
                 .ok_or_else(|| EditorError::Command(format!("missing source node {from}")))?;
             let in_node = document
+                .scene
                 .graph
                 .nodes
                 .iter()
@@ -720,6 +885,7 @@ fn apply_command_internal(document: &mut EditorDocument, command: &EditorCommand
             }
 
             let target = document
+                .scene
                 .graph
                 .nodes
                 .iter_mut()
@@ -732,6 +898,7 @@ fn apply_command_internal(document: &mut EditorDocument, command: &EditorCommand
         }
         EditorCommand::DisconnectNodes { from, to } => {
             let target = document
+                .scene
                 .graph
                 .nodes
                 .iter_mut()
@@ -744,6 +911,7 @@ fn apply_command_internal(document: &mut EditorDocument, command: &EditorCommand
         }
         EditorCommand::SetNodeKind { node_id, new, .. } => {
             let node = document
+                .scene
                 .graph
                 .nodes
                 .iter_mut()
@@ -753,6 +921,7 @@ fn apply_command_internal(document: &mut EditorDocument, command: &EditorCommand
         }
         EditorCommand::SetNodeTarget { node_id, new, .. } => {
             let node = document
+                .scene
                 .graph
                 .nodes
                 .iter_mut()
@@ -762,6 +931,7 @@ fn apply_command_internal(document: &mut EditorDocument, command: &EditorCommand
         }
         EditorCommand::SetNodeFallback { node_id, new, .. } => {
             let node = document
+                .scene
                 .graph
                 .nodes
                 .iter_mut()
@@ -776,6 +946,7 @@ fn apply_command_internal(document: &mut EditorDocument, command: &EditorCommand
             ..
         } => {
             let node = document
+                .scene
                 .graph
                 .nodes
                 .iter_mut()
@@ -785,12 +956,10 @@ fn apply_command_internal(document: &mut EditorDocument, command: &EditorCommand
             node.shader_profile = new_profile.clone();
         }
         EditorCommand::SetNodeSetting {
-            node_id,
-            key,
-            new,
-            ..
+            node_id, key, new, ..
         } => {
             let node = document
+                .scene
                 .graph
                 .nodes
                 .iter_mut()
@@ -806,6 +975,236 @@ fn apply_command_internal(document: &mut EditorDocument, command: &EditorCommand
                 }
             }
         }
+        EditorCommand::AddLayer { layer } => {
+            if document
+                .scene
+                .layers
+                .iter()
+                .any(|existing| existing.layer_id == layer.layer_id)
+            {
+                return Err(EditorError::Command(format!(
+                    "duplicate layer id {}",
+                    layer.layer_id
+                )));
+            }
+            document.scene.layers.push(layer.clone());
+            document.scene.layers.sort_by_key(|entry| entry.order);
+        }
+        EditorCommand::RemoveLayer {
+            layer,
+            removed_objects,
+        } => {
+            document
+                .scene
+                .layers
+                .retain(|existing| existing.layer_id != layer.layer_id);
+            let removed_set = removed_objects
+                .iter()
+                .map(|object| object.object_id)
+                .collect::<BTreeSet<_>>();
+            document
+                .scene
+                .objects
+                .retain(|existing| !removed_set.contains(&existing.object_id));
+        }
+        EditorCommand::SetLayerProps {
+            layer_id,
+            new_name,
+            new_order,
+            new_visible,
+            new_locked,
+            ..
+        } => {
+            let layer = document
+                .scene
+                .layers
+                .iter_mut()
+                .find(|layer| layer.layer_id == *layer_id)
+                .ok_or_else(|| EditorError::Command(format!("missing layer {layer_id}")))?;
+            layer.name = new_name.clone();
+            layer.order = *new_order;
+            layer.visible = *new_visible;
+            layer.locked = *new_locked;
+            document.scene.layers.sort_by_key(|entry| entry.order);
+        }
+        EditorCommand::AddObject { object } => {
+            if document
+                .scene
+                .objects
+                .iter()
+                .any(|existing| existing.object_id == object.object_id)
+            {
+                return Err(EditorError::Command(format!(
+                    "duplicate object id {}",
+                    object.object_id
+                )));
+            }
+            if !document
+                .scene
+                .layers
+                .iter()
+                .any(|layer| layer.layer_id == object.layer_id)
+            {
+                return Err(EditorError::Command(format!(
+                    "object references missing layer {}",
+                    object.layer_id
+                )));
+            }
+            if let Some(parent) = object.parent {
+                if !document
+                    .scene
+                    .objects
+                    .iter()
+                    .any(|existing| existing.object_id == parent)
+                {
+                    return Err(EditorError::Command(format!(
+                        "object references missing parent {}",
+                        parent
+                    )));
+                }
+            }
+            document.scene.objects.push(object.clone());
+        }
+        EditorCommand::RemoveObject { object } => {
+            document
+                .scene
+                .objects
+                .retain(|existing| existing.object_id != object.object_id);
+            for other in &mut document.scene.objects {
+                if other.parent == Some(object.object_id) {
+                    other.parent = None;
+                }
+            }
+        }
+        EditorCommand::ReparentObject {
+            object_id,
+            new_parent,
+            ..
+        } => {
+            if let Some(parent) = new_parent {
+                if *parent == *object_id {
+                    return Err(EditorError::Command(
+                        "cannot parent object to itself".to_string(),
+                    ));
+                }
+                if !document
+                    .scene
+                    .objects
+                    .iter()
+                    .any(|existing| existing.object_id == *parent)
+                {
+                    return Err(EditorError::Command(format!(
+                        "missing parent object {parent}"
+                    )));
+                }
+                if would_create_cycle(&document.scene.objects, *object_id, *parent) {
+                    return Err(EditorError::Command(
+                        "reparent would create hierarchy cycle".to_string(),
+                    ));
+                }
+            }
+            let object = document
+                .scene
+                .objects
+                .iter_mut()
+                .find(|object| object.object_id == *object_id)
+                .ok_or_else(|| EditorError::Command(format!("missing object {object_id}")))?;
+            object.parent = *new_parent;
+        }
+        EditorCommand::MoveObjectToLayer {
+            object_id,
+            new_layer,
+            ..
+        } => {
+            if !document
+                .scene
+                .layers
+                .iter()
+                .any(|layer| layer.layer_id == *new_layer)
+            {
+                return Err(EditorError::Command(format!("missing layer {new_layer}")));
+            }
+            let object = document
+                .scene
+                .objects
+                .iter_mut()
+                .find(|object| object.object_id == *object_id)
+                .ok_or_else(|| EditorError::Command(format!("missing object {object_id}")))?;
+            object.layer_id = *new_layer;
+        }
+        EditorCommand::SetObjectName {
+            object_id,
+            new_name,
+            ..
+        } => {
+            let object = document
+                .scene
+                .objects
+                .iter_mut()
+                .find(|object| object.object_id == *object_id)
+                .ok_or_else(|| EditorError::Command(format!("missing object {object_id}")))?;
+            object.name = new_name.clone();
+        }
+        EditorCommand::SetObjectTransform { object_id, new, .. } => {
+            let object = document
+                .scene
+                .objects
+                .iter_mut()
+                .find(|object| object.object_id == *object_id)
+                .ok_or_else(|| EditorError::Command(format!("missing object {object_id}")))?;
+            object.components.transform = new.clone();
+        }
+        EditorCommand::SetObjectSprite { object_id, new, .. } => {
+            let object = document
+                .scene
+                .objects
+                .iter_mut()
+                .find(|object| object.object_id == *object_id)
+                .ok_or_else(|| EditorError::Command(format!("missing object {object_id}")))?;
+            object.components.sprite = new.clone();
+        }
+        EditorCommand::SetObjectCollider { object_id, new, .. } => {
+            let object = document
+                .scene
+                .objects
+                .iter_mut()
+                .find(|object| object.object_id == *object_id)
+                .ok_or_else(|| EditorError::Command(format!("missing object {object_id}")))?;
+            object.components.collider = new.clone();
+        }
+        EditorCommand::SetObjectCamera { object_id, new, .. } => {
+            let object = document
+                .scene
+                .objects
+                .iter_mut()
+                .find(|object| object.object_id == *object_id)
+                .ok_or_else(|| EditorError::Command(format!("missing object {object_id}")))?;
+            object.components.camera = new.clone();
+        }
+        EditorCommand::SetObjectCustom {
+            object_id,
+            key,
+            new,
+            ..
+        } => {
+            let object = document
+                .scene
+                .objects
+                .iter_mut()
+                .find(|object| object.object_id == *object_id)
+                .ok_or_else(|| EditorError::Command(format!("missing object {object_id}")))?;
+            match new {
+                Some(value) => {
+                    object
+                        .components
+                        .custom_properties
+                        .insert(key.clone(), value.clone());
+                }
+                None => {
+                    object.components.custom_properties.remove(key);
+                }
+            }
+        }
         EditorCommand::Batch { commands } => {
             for nested in commands {
                 apply_command_internal(document, nested)?;
@@ -813,7 +1212,8 @@ fn apply_command_internal(document: &mut EditorDocument, command: &EditorCommand
         }
     }
 
-    document.graph.version = CURRENT_GRAPH_VERSION;
+    validate_document_integrity(document)?;
+    document.scene.graph.version = CURRENT_GRAPH_VERSION;
     Ok(())
 }
 
@@ -827,6 +1227,76 @@ fn load_session(project_root: &Path) -> Result<Option<EditorSessionState>, Edito
     let parsed = ron::from_str::<EditorSessionState>(&raw)
         .map_err(|err| EditorError::SessionParse(err.to_string()))?;
     Ok(Some(parsed))
+}
+
+fn would_create_cycle(objects: &[SceneObject], object_id: u64, candidate_parent: u64) -> bool {
+    let mut cursor = Some(candidate_parent);
+    while let Some(current) = cursor {
+        if current == object_id {
+            return true;
+        }
+        cursor = objects
+            .iter()
+            .find(|object| object.object_id == current)
+            .and_then(|object| object.parent);
+    }
+    false
+}
+
+fn validate_document_integrity(document: &EditorDocument) -> Result<(), EditorError> {
+    let layer_ids = document
+        .scene
+        .layers
+        .iter()
+        .map(|layer| layer.layer_id)
+        .collect::<BTreeSet<_>>();
+    for object in &document.scene.objects {
+        if !layer_ids.contains(&object.layer_id) {
+            return Err(EditorError::Command(format!(
+                "object {} references missing layer {}",
+                object.object_id, object.layer_id
+            )));
+        }
+        if let Some(parent) = object.parent {
+            if !document
+                .scene
+                .objects
+                .iter()
+                .any(|candidate| candidate.object_id == parent)
+            {
+                return Err(EditorError::Command(format!(
+                    "object {} references missing parent {}",
+                    object.object_id, parent
+                )));
+            }
+            if would_create_cycle(&document.scene.objects, object.object_id, parent) {
+                return Err(EditorError::Command(format!(
+                    "hierarchy cycle detected for object {}",
+                    object.object_id
+                )));
+            }
+        }
+    }
+
+    let node_ids = document
+        .scene
+        .graph
+        .nodes
+        .iter()
+        .map(|node| node.id)
+        .collect::<BTreeSet<_>>();
+    for node in &document.scene.graph.nodes {
+        for dep in &node.dependencies {
+            if !node_ids.contains(dep) {
+                return Err(EditorError::Command(format!(
+                    "node {} has dangling dependency {}",
+                    node.id, dep
+                )));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn collect_files_recursive(root: &Path, output: &mut Vec<PathBuf>) -> Result<(), EditorError> {
@@ -890,7 +1360,7 @@ impl GraphCanvasState {
         self.node_map.clear();
         self.last_positions.clear();
 
-        for node in &document.graph.nodes {
+        for node in &document.scene.graph.nodes {
             let pos = document
                 .node_positions
                 .get(&node.id)
@@ -903,7 +1373,7 @@ impl GraphCanvasState {
             self.last_positions.insert(node.id, pos);
         }
 
-        for node in &document.graph.nodes {
+        for node in &document.scene.graph.nodes {
             let Some(target_id) = self.node_map.get(&node.id).copied() else {
                 continue;
             };
@@ -941,7 +1411,8 @@ impl GraphCanvasState {
             workspace_mode,
         };
         let style = SnarlStyle::new();
-        self.snarl.show(&mut viewer, &style, "editor_graph_snarl", ui);
+        self.snarl
+            .show(&mut viewer, &style, "editor_graph_snarl", ui);
 
         let mut output = GraphCanvasOutput {
             commands: viewer.commands,
@@ -1005,7 +1476,12 @@ impl<'a> SnarlViewer<SnarlVisualNode> for ProjectSnarlViewer<'a> {
         1
     }
 
-    fn show_input(&mut self, pin: &InPin, ui: &mut egui::Ui, snarl: &mut Snarl<SnarlVisualNode>) -> impl egui_snarl::ui::SnarlPin + 'static {
+    fn show_input(
+        &mut self,
+        pin: &InPin,
+        ui: &mut egui::Ui,
+        snarl: &mut Snarl<SnarlVisualNode>,
+    ) -> impl egui_snarl::ui::SnarlPin + 'static {
         let node = &snarl[pin.id.node];
         ui.label(format!("in: {:?}", node_input_pin_type(node.kind)));
         PinInfo::circle().with_fill(egui::Color32::from_rgb(100, 180, 255))
@@ -1015,7 +1491,12 @@ impl<'a> SnarlViewer<SnarlVisualNode> for ProjectSnarlViewer<'a> {
         1
     }
 
-    fn show_output(&mut self, pin: &OutPin, ui: &mut egui::Ui, snarl: &mut Snarl<SnarlVisualNode>) -> impl egui_snarl::ui::SnarlPin + 'static {
+    fn show_output(
+        &mut self,
+        pin: &OutPin,
+        ui: &mut egui::Ui,
+        snarl: &mut Snarl<SnarlVisualNode>,
+    ) -> impl egui_snarl::ui::SnarlPin + 'static {
         let node = &snarl[pin.id.node];
         ui.label(format!("out: {:?}", node_output_pin_type(node.kind)));
         PinInfo::square().with_fill(egui::Color32::from_rgb(255, 180, 100))
@@ -1025,7 +1506,12 @@ impl<'a> SnarlViewer<SnarlVisualNode> for ProjectSnarlViewer<'a> {
         true
     }
 
-    fn show_graph_menu(&mut self, pos: egui::Pos2, ui: &mut egui::Ui, snarl: &mut Snarl<SnarlVisualNode>) {
+    fn show_graph_menu(
+        &mut self,
+        pos: egui::Pos2,
+        ui: &mut egui::Ui,
+        snarl: &mut Snarl<SnarlVisualNode>,
+    ) {
         for kind in workspace_kinds(self.workspace_mode) {
             if ui.button(format!("Add {:?}", kind)).clicked() {
                 let new_id = *self.next_node_id;
@@ -1072,6 +1558,7 @@ impl<'a> SnarlViewer<SnarlVisualNode> for ProjectSnarlViewer<'a> {
                     gpu_resource_states: Vec::new(),
                     shader_entry: None,
                     shader_profile: None,
+                    payload: None,
                 },
                 position: None,
             };
@@ -1128,11 +1615,7 @@ impl<'a> SnarlViewer<SnarlVisualNode> for ProjectSnarlViewer<'a> {
     }
 }
 
-fn build_node_for_kind(
-    id: NodeId,
-    kind: NodeKind,
-    asset: Option<&ProjectAssetEntry>,
-) -> Node {
+fn build_node_for_kind(id: NodeId, kind: NodeKind, asset: Option<&ProjectAssetEntry>) -> Node {
     let mut node = Node {
         id,
         name: format!("{:?}_{id}", kind).to_ascii_lowercase(),
@@ -1156,6 +1639,7 @@ fn build_node_for_kind(
         gpu_resource_states: Vec::new(),
         shader_entry: None,
         shader_profile: None,
+        payload: Some(default_payload_for_kind(kind)),
     };
 
     if let Some(asset) = asset {
@@ -1163,6 +1647,10 @@ fn build_node_for_kind(
             .insert("asset_path".to_string(), asset.path.display().to_string());
         node.settings
             .insert("asset_kind".to_string(), format!("{:?}", asset.kind));
+        node.payload = Some(NodePayload::AssetReference(AssetReferencePayload {
+            asset_path: asset.path.display().to_string(),
+            asset_kind: format!("{:?}", asset.kind),
+        }));
         if let Some(stem) = asset.path.file_stem().and_then(|stem| stem.to_str()) {
             node.name = stem.to_string();
         }
@@ -1171,7 +1659,26 @@ fn build_node_for_kind(
     node
 }
 
-pub fn sync_document_dependencies_from_snarl(document: &mut EditorDocument, snarl: &Snarl<SnarlVisualNode>) {
+fn default_payload_for_kind(kind: NodeKind) -> NodePayload {
+    match kind {
+        NodeKind::GameplayEvent => NodePayload::GameplayEvent(GameplayEventPayload::default()),
+        NodeKind::GameplayFlow => NodePayload::GameplayFlow(GameplayFlowPayload::default()),
+        NodeKind::MathState => NodePayload::MathState(MathStatePayload::default()),
+        NodeKind::ScriptBehavior => NodePayload::ScriptBehavior(ScriptBehaviorPayload::default()),
+        NodeKind::ObjectInitializer => {
+            NodePayload::ObjectInitializer(ObjectInitializerPayload::default())
+        }
+        NodeKind::RenderPass => NodePayload::RenderPass(RenderPassPayload::default()),
+        NodeKind::ComputePass => NodePayload::ComputePass(ComputePassPayload::default()),
+        NodeKind::AssetReference => NodePayload::AssetReference(AssetReferencePayload::default()),
+        NodeKind::BuildExport => NodePayload::BuildExport(BuildExportPayload::default()),
+    }
+}
+
+pub fn sync_document_dependencies_from_snarl(
+    document: &mut EditorDocument,
+    snarl: &Snarl<SnarlVisualNode>,
+) {
     let mut deps: BTreeMap<NodeId, BTreeSet<NodeId>> = BTreeMap::new();
 
     for (from, to) in snarl.wires() {
@@ -1185,7 +1692,7 @@ pub fn sync_document_dependencies_from_snarl(document: &mut EditorDocument, snar
         deps.entry(to_node).or_default().insert(from_node);
     }
 
-    for node in &mut document.graph.nodes {
+    for node in &mut document.scene.graph.nodes {
         node.dependencies = deps
             .get(&node.id)
             .map(|set| set.iter().copied().collect())
@@ -1193,6 +1700,7 @@ pub fn sync_document_dependencies_from_snarl(document: &mut EditorDocument, snar
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn apply_inspector_node_change(
     project: &mut EditorProjectState,
     node_id: NodeId,
@@ -1203,7 +1711,15 @@ pub fn apply_inspector_node_change(
     shader_profile: Option<Option<String>>,
     setting_change: Option<(String, Option<String>)>,
 ) -> Result<(), EditorError> {
-    let Some(node) = project.document.graph.nodes.iter().find(|node| node.id == node_id).cloned() else {
+    let Some(node) = project
+        .document
+        .scene
+        .graph
+        .nodes
+        .iter()
+        .find(|node| node.id == node_id)
+        .cloned()
+    else {
         return Ok(());
     };
 
@@ -1369,6 +1885,7 @@ pub fn draw_overlay(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use engine_assets::SceneComponents;
     use std::collections::BTreeMap;
 
     fn sample_node(id: NodeId, kind: NodeKind) -> Node {
@@ -1385,14 +1902,24 @@ mod tests {
             gpu_resource_states: vec![],
             shader_entry: None,
             shader_profile: None,
+            payload: Some(default_payload_for_kind(kind)),
         }
     }
 
     #[test]
     fn pin_contract_rules_are_stable() {
-        assert!(pin_types_compatible(PinTypeCategory::Texture, PinTypeCategory::Texture));
-        assert!(pin_types_compatible(PinTypeCategory::Texture, PinTypeCategory::Data));
-        assert!(!pin_types_compatible(PinTypeCategory::Audio, PinTypeCategory::Texture));
+        assert!(pin_types_compatible(
+            PinTypeCategory::Texture,
+            PinTypeCategory::Texture
+        ));
+        assert!(pin_types_compatible(
+            PinTypeCategory::Texture,
+            PinTypeCategory::Data
+        ));
+        assert!(!pin_types_compatible(
+            PinTypeCategory::Audio,
+            PinTypeCategory::Texture
+        ));
     }
 
     #[test]
@@ -1490,7 +2017,9 @@ mod tests {
             d3,
         );
 
-        let parent = history.nodes[&branch].parent.expect("branch should have parent");
+        let parent = history.nodes[&branch]
+            .parent
+            .expect("branch should have parent");
         assert!(history.nodes[&parent].children.len() >= 2);
     }
 
@@ -1500,10 +2029,12 @@ mod tests {
         let _ = fs::remove_dir_all(&temp_dir);
         fs::create_dir_all(temp_dir.join("assets")).expect("create temp assets dir");
 
-        let scene = temp_dir.join("assets/sample_scene.ron");
-        save_node_graph(&scene, &NodeGraph::empty()).expect("save scene");
+        let scene = temp_dir.join("assets/sample_scene.scene.ron");
+        save_scene_document(&scene, &SceneDocument::from_graph(NodeGraph::empty()))
+            .expect("save scene");
 
-        let mut project = EditorProjectState::open(&temp_dir, Some(scene.clone())).expect("open project");
+        let mut project =
+            EditorProjectState::open(&temp_dir, Some(scene.clone())).expect("open project");
         project
             .apply_command_batch(
                 "add_node",
@@ -1519,5 +2050,67 @@ mod tests {
         assert!(!reopened.session.history.nodes.is_empty());
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn scene_commands_roundtrip_and_cycle_validation() {
+        let mut document = EditorDocument::from_scene(SceneDocument::new_default());
+
+        let layer = SceneLayer {
+            layer_id: 9,
+            name: "Gameplay".to_string(),
+            order: 9,
+            visible: true,
+            locked: false,
+        };
+        apply_command_internal(
+            &mut document,
+            &EditorCommand::AddLayer {
+                layer: layer.clone(),
+            },
+        )
+        .expect("layer add should apply");
+
+        let parent_object = SceneObject {
+            object_id: 10,
+            parent: None,
+            layer_id: 9,
+            name: "Parent".to_string(),
+            tags: vec![],
+            components: SceneComponents::default(),
+        };
+        let child_object = SceneObject {
+            object_id: 11,
+            parent: Some(10),
+            layer_id: 9,
+            name: "Child".to_string(),
+            tags: vec![],
+            components: SceneComponents::default(),
+        };
+        apply_command_internal(
+            &mut document,
+            &EditorCommand::AddObject {
+                object: parent_object.clone(),
+            },
+        )
+        .expect("parent object add should apply");
+        apply_command_internal(
+            &mut document,
+            &EditorCommand::AddObject {
+                object: child_object.clone(),
+            },
+        )
+        .expect("child object add should apply");
+
+        let cycle_err = apply_command_internal(
+            &mut document,
+            &EditorCommand::ReparentObject {
+                object_id: 10,
+                old_parent: None,
+                new_parent: Some(11),
+            },
+        )
+        .expect_err("cycle should fail");
+        assert!(matches!(cycle_err, EditorError::Command(_)));
     }
 }

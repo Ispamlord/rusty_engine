@@ -27,7 +27,16 @@
   - deterministic topo compile
   - executable GPU pass plan with dependencies/resource access metadata
   - backend-aware fallback behavior and strict-GPU mode
-  - shader entry/profile metadata on nodes
+  - shader entry/profile metadata on nodes and typed node payload schema
+  - script job extraction for `ScriptBehavior` nodes
+- Scene document runtime/editor model:
+  - unified `.scene.ron` document with hierarchy, layers, components, and embedded graph
+  - explicit legacy graph-only file rejection in editor flow
+  - scene-command validation (hierarchy cycle checks, layer integrity, dangling graph dependency checks)
+- Embedded script runtime:
+  - `rhai` execution for `ScriptBehavior` nodes
+  - cached script ASTs with hot-reload invalidation
+  - host API for scene/object mutation, custom state, events, and diagnostics logging
 - Asset pipeline hardening:
   - deterministic shader compile keys from source/include hashes + compiler signature + flags/profiles
   - include dependency tracking and cache invalidation of dependents
@@ -37,6 +46,11 @@
   - fixed-step clamp policy to prevent spiral-of-death
   - frame pacing controls and recovery policy controls from config
   - hot-reload application for graph/shader changes with runtime-safe fallback
+  - scene-level activation API (`set_active_scene`) with graph compatibility path
+- Viewport/editor integration:
+  - backend viewport readback contract and per-backend synthesized frame output
+  - editor viewport panel displays runtime frame content (not static synthetic scene-only paint)
+  - diagnostics include compile anchors and focus actions
 - Performance and CI:
   - perf smoke and perf regression harness examples
   - CI matrix with CPU jobs, optional GPU jobs, and advisory Proton/Wine DX checks
@@ -53,11 +67,11 @@
 - `backend_dx11`: DX11 compatibility backend implementation
 - `engine_platform`: backend selection policy (`DX12 -> Vulkan -> DX11` on Windows, `Vulkan` on Linux)
 - `engine_nodes`: graph schema + compile pipeline to ECS jobs and executable GPU plan
-- `engine_assets`: RON graph load/save, shader build cache, hot-reload scanning
+- `engine_assets`: `.scene.ron` load/save, graph compatibility APIs, shader build cache, hot-reload scanning
 - `engine_audio`: Kira audio runtime wrapper + ECS sync system
 - `engine_physics`: Rapier2D world resource + ECS sync system
-- `engine_editor`: overlay/profiler/diagnostics panel model
-- `engine_editor_app`: dedicated visual-programming editor app (graph canvas, inspector, diagnostics, embedded play mode)
+- `engine_editor`: editor domain model, command/history graph, scene+graph validation
+- `engine_editor_app`: visual-programming editor app (layers/hierarchy/object inspector, graph canvas, diagnostics, embedded play mode)
 - `engine_app`: runtime orchestration, phase scheduling, backend execution, recovery/hot-reload
 
 ## Prerequisites
@@ -156,7 +170,7 @@ cargo run -p engine_app --example perf_regression
 Optional custom paths:
 
 ```bash
-cargo run -p engine_app --example bootstrap config/default.ron assets/sample_scene.ron
+cargo run -p engine_app --example bootstrap config/default.ron assets/sample_scene.scene.ron
 ```
 
 ## Editor usage
@@ -177,12 +191,12 @@ cargo run -p engine_editor_app -- --project <path> --scene <path>
 Headless startup smoke mode (for CI):
 
 ```bash
-cargo run -p engine_editor_app -- --project . --scene assets/sample_scene.ron --smoke
+cargo run -p engine_editor_app -- --project . --scene assets/sample_scene.scene.ron --smoke
 ```
 
 Editor guide:
 
-- See [docs/editor_workflow.md](docs/editor_workflow.md) for the current project manager, workspace split, asset drag-and-drop, and node authoring flow.
+- See [docs/editor_workflow.md](docs/editor_workflow.md) for scene workflow, hierarchy/layer editing, graph workflow, viewport controls, and shortcuts.
 
 First-scene workflow:
 
@@ -190,9 +204,9 @@ First-scene workflow:
 2. Use the Project Manager to open or create a project before entering the editor.
 3. Switch between `Gameplay / Script` and `Render Pipeline` workspaces depending on the graph you want to edit.
 4. Drag assets from the Assets panel into the graph to create asset reference nodes, or right-click the canvas to add nodes manually.
-5. Select a node to edit execution target, fallback, and other node settings in Inspector.
+5. Use Hierarchy/Layers + Object Inspector to edit scene objects/components, and Node Inspector for logic/render nodes.
 6. Click `Hot Recompile` and use `Play` / `Stop` / `Step` controls.
-7. Save with `Save` or `Save As autosave_scene.ron`.
+7. Save with `Save` or `Save As autosave_scene.scene.ron`.
 
 ## CI
 

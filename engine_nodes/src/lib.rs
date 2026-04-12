@@ -12,6 +12,170 @@ pub const CURRENT_GRAPH_VERSION: u32 = 2;
 
 pub type NodeId = u64;
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GameplayEventPayload {
+    pub event_name: String,
+}
+
+impl Default for GameplayEventPayload {
+    fn default() -> Self {
+        Self {
+            event_name: "on_update".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GameplayFlowPayload {
+    pub condition_key: String,
+    pub expected_value: String,
+}
+
+impl Default for GameplayFlowPayload {
+    fn default() -> Self {
+        Self {
+            condition_key: "state".to_string(),
+            expected_value: "ready".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MathStatePayload {
+    pub operation: String,
+    pub lhs: f32,
+    pub rhs: f32,
+    pub output_key: String,
+}
+
+impl Default for MathStatePayload {
+    fn default() -> Self {
+        Self {
+            operation: "add".to_string(),
+            lhs: 0.0,
+            rhs: 0.0,
+            output_key: "result".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ObjectInitializerPayload {
+    pub object_name: String,
+    pub layer_id: u64,
+    pub x: f32,
+    pub y: f32,
+}
+
+impl Default for ObjectInitializerPayload {
+    fn default() -> Self {
+        Self {
+            object_name: "Entity".to_string(),
+            layer_id: 1,
+            x: 0.0,
+            y: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScriptBehaviorPayload {
+    pub script_asset: String,
+    pub entry: String,
+    pub frame_phase: String,
+}
+
+impl Default for ScriptBehaviorPayload {
+    fn default() -> Self {
+        Self {
+            script_asset: "assets/scripts/behavior.rhai".to_string(),
+            entry: "update".to_string(),
+            frame_phase: "gameplay".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenderPassPayload {
+    pub target_resource: String,
+    pub target_width: u32,
+    pub target_height: u32,
+    pub sprite_count: u32,
+    pub blend: String,
+}
+
+impl Default for RenderPassPayload {
+    fn default() -> Self {
+        Self {
+            target_resource: "frame_color".to_string(),
+            target_width: 1920,
+            target_height: 1080,
+            sprite_count: 0,
+            blend: "alpha".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComputePassPayload {
+    pub shader: String,
+    pub dispatch: [u32; 3],
+    pub reads: Vec<String>,
+    pub writes: Vec<String>,
+}
+
+impl Default for ComputePassPayload {
+    fn default() -> Self {
+        Self {
+            shader: "compute.hlsl".to_string(),
+            dispatch: [1, 1, 1],
+            reads: Vec::new(),
+            writes: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssetReferencePayload {
+    pub asset_path: String,
+    pub asset_kind: String,
+}
+
+impl Default for AssetReferencePayload {
+    fn default() -> Self {
+        Self {
+            asset_path: String::new(),
+            asset_kind: "Unknown".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuildExportPayload {
+    pub target: String,
+}
+
+impl Default for BuildExportPayload {
+    fn default() -> Self {
+        Self {
+            target: "build/default".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum NodePayload {
+    GameplayEvent(GameplayEventPayload),
+    GameplayFlow(GameplayFlowPayload),
+    MathState(MathStatePayload),
+    ScriptBehavior(ScriptBehaviorPayload),
+    ObjectInitializer(ObjectInitializerPayload),
+    RenderPass(RenderPassPayload),
+    ComputePass(ComputePassPayload),
+    AssetReference(AssetReferencePayload),
+    BuildExport(BuildExportPayload),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NodeExecutionTarget {
     Cpu,
@@ -73,7 +237,7 @@ impl Default for ComputeDispatchConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Node {
     pub id: NodeId,
     pub name: String,
@@ -93,9 +257,11 @@ pub struct Node {
     pub shader_entry: Option<String>,
     #[serde(default)]
     pub shader_profile: Option<String>,
+    #[serde(default)]
+    pub payload: Option<NodePayload>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NodeGraph {
     pub version: u32,
     pub nodes: Vec<Node>,
@@ -155,6 +321,7 @@ pub struct EcsJobDescriptor {
     pub node_name: String,
     pub phase: String,
     pub execution: ResolvedExecutionTarget,
+    pub payload_hint: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -165,6 +332,23 @@ pub struct GpuPassDescriptor {
     pub is_compute: bool,
     pub shader_entry: String,
     pub shader_profile: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScriptJobDescriptor {
+    pub node_id: NodeId,
+    pub node_name: String,
+    pub script_asset: String,
+    pub entry: String,
+    pub frame_phase: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiagnosticAnchor {
+    pub node_id: Option<NodeId>,
+    pub object_id: Option<u64>,
+    pub message: String,
+    pub severity: DiagnosticSeverity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -200,10 +384,12 @@ pub struct CompiledGraphArtifact {
     pub node_order: Vec<NodeId>,
     pub ecs_jobs: Vec<EcsJobDescriptor>,
     pub gpu_passes: Vec<GpuPassDescriptor>,
+    pub script_jobs: Vec<ScriptJobDescriptor>,
     pub execution_plan: ExecutableRenderPlan,
     pub render_graph: RenderGraph,
     pub resource_lifetimes: Vec<GpuResourceLifetime>,
     pub diagnostics: Vec<CompileDiagnostic>,
+    pub diagnostic_anchors: Vec<DiagnosticAnchor>,
 }
 
 #[derive(Debug, Error)]
@@ -345,8 +531,10 @@ pub fn compile_graph(
         graph.nodes.iter().map(|node| (node.id, node)).collect();
 
     let mut diagnostics = Vec::new();
+    let mut diagnostic_anchors = Vec::new();
     let mut ecs_jobs = Vec::new();
     let mut gpu_passes = Vec::new();
+    let mut script_jobs = Vec::new();
     let mut execution_plan = ExecutableRenderPlan::default();
     let mut render_graph = RenderGraph::empty();
     let mut resource_usage: HashMap<String, (usize, usize)> = HashMap::new();
@@ -365,7 +553,19 @@ pub fn compile_graph(
             node_name: node.name.clone(),
             phase,
             execution,
+            payload_hint: payload_hint(node),
         });
+
+        if node.kind == NodeKind::ScriptBehavior {
+            let payload = script_payload(node);
+            script_jobs.push(ScriptJobDescriptor {
+                node_id: node.id,
+                node_name: node.name.clone(),
+                script_asset: payload.script_asset,
+                entry: payload.entry,
+                frame_phase: payload.frame_phase,
+            });
+        }
 
         if execution != ResolvedExecutionTarget::Gpu {
             continue;
@@ -383,11 +583,8 @@ pub fn compile_graph(
 
         match node.kind {
             NodeKind::RenderPass | NodeKind::BuildExport => {
-                let target_name = node
-                    .settings
-                    .get("target_resource")
-                    .cloned()
-                    .unwrap_or_else(|| "frame_color".to_string());
+                let render_payload = render_pass_payload(node);
+                let target_name = render_payload.target_resource.clone();
 
                 let target_handle = RenderTargetHandle(node.id);
                 ensure_resource(
@@ -395,8 +592,8 @@ pub fn compile_graph(
                     GraphResourceDescriptor {
                         name: target_name.clone(),
                         kind: GraphResourceKind::RenderTarget(RenderTargetDescriptor {
-                            width: parse_u32_setting(node, "target_width", 1920),
-                            height: parse_u32_setting(node, "target_height", 1080),
+                            width: render_payload.target_width,
+                            height: render_payload.target_height,
                         }),
                         lifetime: GraphResourceLifetime::Transient,
                     },
@@ -419,15 +616,14 @@ pub fn compile_graph(
                     track_usage(&mut resource_usage, &binding.resource, current_pass_index);
                 }
 
-                let mut sprites =
-                    make_placeholder_sprites(parse_u32_setting(node, "sprite_count", 0));
+                let mut sprites = make_placeholder_sprites(render_payload.sprite_count);
                 if options.optimize {
                     sprites.sort_by_key(|sprite| sprite.texture.0);
                 }
 
                 let batch = SpriteBatchCommand {
                     label: format!("{}::sprites", node.name),
-                    blend: parse_blend_mode(node.settings.get("blend")),
+                    blend: parse_blend_mode(Some(&render_payload.blend)),
                     target: Some(target_handle),
                     sprites,
                 };
@@ -457,15 +653,15 @@ pub fn compile_graph(
                 });
             }
             NodeKind::ComputePass => {
-                let dispatch = node.compute.unwrap_or_default();
-                let shader = node
-                    .settings
-                    .get("shader")
-                    .cloned()
-                    .unwrap_or_else(|| format!("{}.hlsl", node.name));
-
-                let reads = parse_csv(node.settings.get("read_resources"));
-                let writes = parse_csv(node.settings.get("write_resources"));
+                let compute_payload = compute_pass_payload(node);
+                let dispatch = if let Some(config) = node.compute {
+                    [config.x, config.y, config.z]
+                } else {
+                    compute_payload.dispatch
+                };
+                let shader = compute_payload.shader;
+                let reads = compute_payload.reads;
+                let writes = compute_payload.writes;
 
                 for resource in reads.iter().chain(writes.iter()) {
                     ensure_resource(
@@ -496,7 +692,7 @@ pub fn compile_graph(
                     engine_render_api::ComputeDispatchNode {
                         label: node.name.clone(),
                         shader,
-                        dispatch: [dispatch.x, dispatch.y, dispatch.z],
+                        dispatch,
                         reads,
                         writes,
                     },
@@ -541,14 +737,25 @@ pub fn compile_graph(
 
     resource_lifetimes.sort_by(|a, b| a.resource.cmp(&b.resource));
 
+    for diagnostic in &diagnostics {
+        diagnostic_anchors.push(DiagnosticAnchor {
+            node_id: diagnostic.node_id,
+            object_id: None,
+            message: diagnostic.message.clone(),
+            severity: diagnostic.severity,
+        });
+    }
+
     Ok(CompiledGraphArtifact {
         node_order,
         ecs_jobs,
         gpu_passes,
+        script_jobs,
         execution_plan,
         render_graph,
         resource_lifetimes,
         diagnostics,
+        diagnostic_anchors,
     })
 }
 
@@ -560,6 +767,24 @@ fn resolve_execution_target(
 ) -> Result<ResolvedExecutionTarget, NodeCompileError> {
     if options.force_cpu_fallback {
         return Ok(ResolvedExecutionTarget::Cpu);
+    }
+
+    if node.kind == NodeKind::ScriptBehavior {
+        match node.target {
+            NodeExecutionTarget::Cpu => return Ok(ResolvedExecutionTarget::Cpu),
+            NodeExecutionTarget::Hybrid => {
+                diagnostics.push(CompileDiagnostic {
+                    severity: DiagnosticSeverity::Info,
+                    node_id: Some(node.id),
+                    message: "ScriptBehavior executes on CPU even when Hybrid is selected"
+                        .to_string(),
+                });
+                return Ok(ResolvedExecutionTarget::Cpu);
+            }
+            NodeExecutionTarget::Gpu => {
+                return fallback_for_unsupported_gpu(node, options, diagnostics);
+            }
+        }
     }
 
     let gpu_supported = capabilities.gpu_nodes;
@@ -653,6 +878,126 @@ fn phase_for_node_kind(kind: NodeKind) -> &'static str {
     }
 }
 
+fn payload_hint(node: &Node) -> String {
+    match &node.payload {
+        Some(NodePayload::GameplayEvent(payload)) => {
+            format!("event:{}", payload.event_name)
+        }
+        Some(NodePayload::GameplayFlow(payload)) => {
+            format!("flow:{}={}", payload.condition_key, payload.expected_value)
+        }
+        Some(NodePayload::MathState(payload)) => {
+            format!(
+                "math:{}({}, {})",
+                payload.operation, payload.lhs, payload.rhs
+            )
+        }
+        Some(NodePayload::ScriptBehavior(payload)) => {
+            format!("script:{}::{}", payload.script_asset, payload.entry)
+        }
+        Some(NodePayload::ObjectInitializer(payload)) => {
+            format!("object:{}@{}", payload.object_name, payload.layer_id)
+        }
+        Some(NodePayload::RenderPass(payload)) => {
+            format!(
+                "render:{}:{}x{}:{}",
+                payload.target_resource,
+                payload.target_width,
+                payload.target_height,
+                payload.sprite_count
+            )
+        }
+        Some(NodePayload::ComputePass(payload)) => {
+            format!(
+                "compute:{}:{}x{}x{}",
+                payload.shader, payload.dispatch[0], payload.dispatch[1], payload.dispatch[2]
+            )
+        }
+        Some(NodePayload::AssetReference(payload)) => {
+            format!("asset:{}:{}", payload.asset_kind, payload.asset_path)
+        }
+        Some(NodePayload::BuildExport(payload)) => {
+            format!("export:{}", payload.target)
+        }
+        None => "legacy_settings".to_string(),
+    }
+}
+
+fn script_payload(node: &Node) -> ScriptBehaviorPayload {
+    let mut payload = node
+        .payload
+        .as_ref()
+        .and_then(|payload| match payload {
+            NodePayload::ScriptBehavior(payload) => Some(payload.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+
+    if let Some(script_asset) = node.settings.get("script_asset") {
+        payload.script_asset = script_asset.clone();
+    }
+    if let Some(entry) = node.settings.get("script_entry") {
+        payload.entry = entry.clone();
+    }
+    if let Some(frame_phase) = node.settings.get("script_phase") {
+        payload.frame_phase = frame_phase.clone();
+    }
+
+    payload
+}
+
+fn render_pass_payload(node: &Node) -> RenderPassPayload {
+    let mut payload = node
+        .payload
+        .as_ref()
+        .and_then(|payload| match payload {
+            NodePayload::RenderPass(payload) => Some(payload.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+
+    if let Some(target_resource) = node.settings.get("target_resource") {
+        payload.target_resource = target_resource.clone();
+    }
+    payload.target_width = parse_u32_setting(node, "target_width", payload.target_width);
+    payload.target_height = parse_u32_setting(node, "target_height", payload.target_height);
+    payload.sprite_count = parse_u32_setting(node, "sprite_count", payload.sprite_count);
+    if let Some(blend) = node.settings.get("blend") {
+        payload.blend = blend.clone();
+    }
+
+    payload
+}
+
+fn compute_pass_payload(node: &Node) -> ComputePassPayload {
+    let mut payload = node
+        .payload
+        .as_ref()
+        .and_then(|payload| match payload {
+            NodePayload::ComputePass(payload) => Some(payload.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+
+    if let Some(shader) = node.settings.get("shader") {
+        payload.shader = shader.clone();
+    }
+    payload.dispatch = node
+        .compute
+        .map(|dispatch| [dispatch.x, dispatch.y, dispatch.z])
+        .unwrap_or(payload.dispatch);
+    let reads = parse_csv(node.settings.get("read_resources"));
+    if !reads.is_empty() {
+        payload.reads = reads;
+    }
+    let writes = parse_csv(node.settings.get("write_resources"));
+    if !writes.is_empty() {
+        payload.writes = writes;
+    }
+
+    payload
+}
+
 fn parse_u32_setting(node: &Node, key: &str, default_value: u32) -> u32 {
     node.settings
         .get(key)
@@ -708,7 +1053,7 @@ fn track_usage(
 
 fn make_placeholder_sprites(count: u32) -> Vec<SpriteInstance> {
     let columns = (count.max(1) as f32).sqrt().ceil().max(1.0) as u32;
-    let rows = (count + columns - 1) / columns;
+    let rows = count.div_ceil(columns);
     let spacing = 72.0;
 
     (0..count)
@@ -777,6 +1122,7 @@ mod tests {
                     gpu_resource_states: vec![],
                     shader_entry: None,
                     shader_profile: None,
+                    payload: Some(NodePayload::GameplayEvent(GameplayEventPayload::default())),
                 },
                 Node {
                     id: 2,
@@ -804,6 +1150,12 @@ mod tests {
                     }],
                     shader_entry: Some("cs_main".to_string()),
                     shader_profile: Some("cs_6_6".to_string()),
+                    payload: Some(NodePayload::ComputePass(ComputePassPayload {
+                        shader: "particles.hlsl".to_string(),
+                        dispatch: [8, 8, 1],
+                        reads: Vec::new(),
+                        writes: vec!["particles_buffer".to_string()],
+                    })),
                 },
                 Node {
                     id: 3,
@@ -821,6 +1173,13 @@ mod tests {
                     gpu_resource_states: vec![],
                     shader_entry: Some("vs_main".to_string()),
                     shader_profile: Some("ps_6_0".to_string()),
+                    payload: Some(NodePayload::RenderPass(RenderPassPayload {
+                        target_resource: "frame_color".to_string(),
+                        target_width: 1920,
+                        target_height: 1080,
+                        sprite_count: 4,
+                        blend: "alpha".to_string(),
+                    })),
                 },
             ],
         }
@@ -837,6 +1196,7 @@ mod tests {
             gpu_nodes: gpu,
             hybrid_nodes: hybrid,
             compute_nodes: compute,
+            viewport_readback: true,
         }
     }
 
@@ -858,6 +1218,7 @@ mod tests {
                     gpu_resource_states: vec![],
                     shader_entry: None,
                     shader_profile: None,
+                    payload: Some(NodePayload::GameplayFlow(GameplayFlowPayload::default())),
                 },
                 Node {
                     id: 2,
@@ -872,6 +1233,7 @@ mod tests {
                     gpu_resource_states: vec![],
                     shader_entry: None,
                     shader_profile: None,
+                    payload: Some(NodePayload::GameplayFlow(GameplayFlowPayload::default())),
                 },
             ],
         };

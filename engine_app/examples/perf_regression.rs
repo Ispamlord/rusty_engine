@@ -10,7 +10,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| "config/default.ron".to_string());
     let scene_path = std::env::args()
         .nth(2)
-        .unwrap_or_else(|| "assets/sample_scene.ron".to_string());
+        .unwrap_or_else(|| "assets/sample_scene.scene.ron".to_string());
 
     let mut app = if Path::new(&config_path).exists() {
         EngineApp::from_config_path(&config_path)?

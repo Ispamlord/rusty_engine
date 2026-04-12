@@ -19,6 +19,7 @@ backend_dx11 = { path = "../backend_dx11" }
 backend_dx12 = { path = "../backend_dx12" }
 backend_vulkan = { path = "../backend_vulkan" }
 ron.workspace = true
+rhai.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 winit.workspace = true

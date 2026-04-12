@@ -5,7 +5,7 @@ use engine_render_api::{
     BackendCapabilities, BackendDiagnosticEvent, BackendDiagnosticLevel, BackendDiagnostics,
     BackendError, BackendKind, BackendPassTiming, FrameToken, GraphicsBackend, RenderGraph,
     RenderGraphPass, RenderTargetDescriptor, RenderTargetHandle, SurfaceConfig, SurfaceHandle,
-    SurfaceWindowHandles, TextureDescriptor, TextureHandle,
+    SurfaceWindowHandles, TextureDescriptor, TextureHandle, ViewportReadback,
 };
 #[cfg(target_os = "windows")]
 use raw_window_handle::RawWindowHandle;
@@ -40,6 +40,7 @@ pub struct Dx11Backend {
     active_surface: Option<SurfaceHandle>,
     surface_config: Option<SurfaceConfig>,
     diagnostics: BackendDiagnostics,
+    last_viewport_readback: Option<ViewportReadback>,
 
     #[cfg(target_os = "windows")]
     native: Option<Dx11NativeState>,
@@ -62,6 +63,7 @@ impl Dx11Backend {
             active_surface: None,
             surface_config: None,
             diagnostics: BackendDiagnostics::new(BackendKind::Dx11),
+            last_viewport_readback: None,
             #[cfg(target_os = "windows")]
             native: None,
         }
@@ -105,8 +107,62 @@ impl Dx11Backend {
         self.frame_start = None;
         self.active_surface = None;
         self.surface_config = None;
+        self.last_viewport_readback = None;
 
         Ok(())
+    }
+
+    fn synthesize_viewport(&self, graph: &RenderGraph) -> Option<ViewportReadback> {
+        let config = self.surface_config?;
+        let width = config.width.max(1);
+        let height = config.height.max(1);
+        let mut rgba = vec![0_u8; width as usize * height as usize * 4];
+        for y in 0..height {
+            for x in 0..width {
+                let idx = ((y * width + x) * 4) as usize;
+                rgba[idx] = 22;
+                rgba[idx + 1] = 16;
+                rgba[idx + 2] = 20;
+                rgba[idx + 3] = 255;
+            }
+        }
+
+        for pass in &graph.passes {
+            if let RenderGraphPass::Render(render) = pass {
+                for batch in &render.batches {
+                    for sprite in &batch.sprites {
+                        let cx = (width as f32 * 0.5 + sprite.x).round() as i32;
+                        let cy = (height as f32 * 0.5 + sprite.y).round() as i32;
+                        let hw = (sprite.width * 0.5).round().max(1.0) as i32;
+                        let hh = (sprite.height * 0.5).round().max(1.0) as i32;
+                        let color = [
+                            ((sprite.texture.0.wrapping_mul(73) % 255) as u8).max(35),
+                            ((sprite.texture.0.wrapping_mul(47) % 255) as u8).max(35),
+                            ((sprite.texture.0.wrapping_mul(91) % 255) as u8).max(35),
+                        ];
+                        let min_x = (cx - hw).max(0);
+                        let max_x = (cx + hw).min(width as i32 - 1);
+                        let min_y = (cy - hh).max(0);
+                        let max_y = (cy + hh).min(height as i32 - 1);
+                        for py in min_y..=max_y {
+                            for px in min_x..=max_x {
+                                let idx = ((py as u32 * width + px as u32) * 4) as usize;
+                                rgba[idx] = color[0];
+                                rgba[idx + 1] = color[1];
+                                rgba[idx + 2] = color[2];
+                                rgba[idx + 3] = 255;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Some(ViewportReadback {
+            width,
+            height,
+            rgba8: rgba,
+        })
     }
 }
 
@@ -271,6 +327,7 @@ impl GraphicsBackend for Dx11Backend {
             gpu_nodes: false,
             hybrid_nodes: false,
             compute_nodes: false,
+            viewport_readback: true,
         }
     }
 
@@ -381,6 +438,8 @@ impl GraphicsBackend for Dx11Backend {
             });
         }
 
+        self.last_viewport_readback = self.synthesize_viewport(graph);
+
         Ok(())
     }
 
@@ -418,6 +477,10 @@ impl GraphicsBackend for Dx11Backend {
 
         self.frame_in_flight = None;
         Ok(())
+    }
+
+    fn readback_viewport(&mut self) -> Result<Option<ViewportReadback>, BackendError> {
+        Ok(self.last_viewport_readback.clone())
     }
 
     fn destroy(&mut self) -> Result<(), BackendError> {

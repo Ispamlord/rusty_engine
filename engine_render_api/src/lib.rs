@@ -29,6 +29,13 @@ pub struct SurfaceHandle(pub u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct FrameToken(pub u64);
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ViewportReadback {
+    pub width: u32,
+    pub height: u32,
+    pub rgba8: Vec<u8>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TextureDescriptor {
     pub width: u32,
@@ -252,6 +259,7 @@ pub struct BackendCapabilities {
     pub gpu_nodes: bool,
     pub hybrid_nodes: bool,
     pub compute_nodes: bool,
+    pub viewport_readback: bool,
 }
 
 impl BackendCapabilities {
@@ -345,6 +353,8 @@ pub trait GraphicsBackend {
     fn submit(&mut self, frame: FrameToken) -> Result<(), BackendError>;
 
     fn present(&mut self, frame: FrameToken) -> Result<(), BackendError>;
+
+    fn readback_viewport(&mut self) -> Result<Option<ViewportReadback>, BackendError>;
 
     fn destroy(&mut self) -> Result<(), BackendError>;
 }

@@ -1,11 +1,11 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
 
 use engine_core::ShaderToolchainConfig;
-use engine_nodes::{deserialize_graph_ron, serialize_graph_ron, NodeGraph};
+use engine_nodes::{deserialize_graph_ron, serialize_graph_ron, NodeGraph, CURRENT_GRAPH_VERSION};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -17,6 +17,226 @@ pub enum AssetKind {
     Graph,
     Shader,
     Unknown,
+}
+
+pub const CURRENT_SCENE_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SceneMetadata {
+    pub name: String,
+    pub author: String,
+    pub description: String,
+}
+
+impl Default for SceneMetadata {
+    fn default() -> Self {
+        Self {
+            name: "Untitled Scene".to_string(),
+            author: "Unknown".to_string(),
+            description: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SceneLayer {
+    pub layer_id: u64,
+    pub name: String,
+    pub order: i32,
+    pub visible: bool,
+    pub locked: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Transform2D {
+    pub x: f32,
+    pub y: f32,
+    pub rotation_radians: f32,
+    pub scale_x: f32,
+    pub scale_y: f32,
+}
+
+impl Default for Transform2D {
+    fn default() -> Self {
+        Self {
+            x: 0.0,
+            y: 0.0,
+            rotation_radians: 0.0,
+            scale_x: 1.0,
+            scale_y: 1.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Sprite2D {
+    pub texture_asset: String,
+    pub width: u32,
+    pub height: u32,
+    pub tint_rgba: [u8; 4],
+    pub layer_order: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Collider2D {
+    pub shape: String,
+    pub radius: f32,
+    pub width: f32,
+    pub height: f32,
+    pub is_sensor: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AudioEmitter {
+    pub asset: String,
+    pub volume: f32,
+    pub looping: bool,
+    pub spatial_blend: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Camera2DComponent {
+    pub zoom: f32,
+    pub near: f32,
+    pub far: f32,
+    pub clear_color_rgba: [u8; 4],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ScriptBinding {
+    pub script_asset: String,
+    pub entry: String,
+    pub frame_phase: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RenderEffectMeta {
+    pub material: String,
+    pub effect_tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
+pub struct SceneComponents {
+    #[serde(default)]
+    pub transform: Transform2D,
+    #[serde(default)]
+    pub sprite: Option<Sprite2D>,
+    #[serde(default)]
+    pub collider: Option<Collider2D>,
+    #[serde(default)]
+    pub audio: Option<AudioEmitter>,
+    #[serde(default)]
+    pub camera: Option<Camera2DComponent>,
+    #[serde(default)]
+    pub script: Option<ScriptBinding>,
+    #[serde(default)]
+    pub custom_properties: BTreeMap<String, String>,
+    #[serde(default)]
+    pub render_effect: Option<RenderEffectMeta>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SceneObject {
+    pub object_id: u64,
+    pub parent: Option<u64>,
+    pub layer_id: u64,
+    pub name: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub components: SceneComponents,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SceneEditorState {
+    #[serde(default)]
+    pub selected_object_ids: Vec<u64>,
+    #[serde(default)]
+    pub selected_layer_id: Option<u64>,
+    #[serde(default)]
+    pub viewport_pan: [f32; 2],
+    #[serde(default = "default_zoom")]
+    pub viewport_zoom: f32,
+}
+
+const fn default_zoom() -> f32 {
+    1.0
+}
+
+impl Default for SceneEditorState {
+    fn default() -> Self {
+        Self {
+            selected_object_ids: Vec::new(),
+            selected_layer_id: None,
+            viewport_pan: [0.0, 0.0],
+            viewport_zoom: 1.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SceneDocument {
+    pub version: u32,
+    #[serde(default)]
+    pub metadata: SceneMetadata,
+    #[serde(default)]
+    pub layers: Vec<SceneLayer>,
+    #[serde(default)]
+    pub objects: Vec<SceneObject>,
+    #[serde(default = "empty_graph")]
+    pub graph: NodeGraph,
+    #[serde(default)]
+    pub editor_state: SceneEditorState,
+}
+
+fn empty_graph() -> NodeGraph {
+    NodeGraph {
+        version: CURRENT_GRAPH_VERSION,
+        nodes: Vec::new(),
+    }
+}
+
+impl SceneDocument {
+    pub fn new_default() -> Self {
+        Self {
+            version: CURRENT_SCENE_VERSION,
+            metadata: SceneMetadata::default(),
+            layers: vec![SceneLayer {
+                layer_id: 1,
+                name: "Main".to_string(),
+                order: 0,
+                visible: true,
+                locked: false,
+            }],
+            objects: vec![SceneObject {
+                object_id: 1,
+                parent: None,
+                layer_id: 1,
+                name: "Camera".to_string(),
+                tags: vec!["camera".to_string()],
+                components: SceneComponents {
+                    camera: Some(Camera2DComponent {
+                        zoom: 1.0,
+                        near: -1000.0,
+                        far: 1000.0,
+                        clear_color_rgba: [16, 20, 28, 255],
+                    }),
+                    ..SceneComponents::default()
+                },
+            }],
+            graph: NodeGraph {
+                version: CURRENT_GRAPH_VERSION,
+                nodes: Vec::new(),
+            },
+            editor_state: SceneEditorState::default(),
+        }
+    }
+
+    pub fn from_graph(graph: NodeGraph) -> Self {
+        let mut scene = Self::new_default();
+        scene.graph = graph;
+        scene
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,6 +328,15 @@ pub enum AssetError {
 
     #[error("graph encode error: {0}")]
     Encode(String),
+
+    #[error("scene parse error: {0}")]
+    SceneParse(String),
+
+    #[error("scene encode error: {0}")]
+    SceneEncode(String),
+
+    #[error("legacy graph-only scene format is not supported for this editor workflow")]
+    LegacyGraphFormat,
 
     #[error("shader parse error: {0}")]
     ShaderParse(String),
@@ -215,6 +444,53 @@ pub fn load_node_graph(path: impl AsRef<Path>) -> Result<NodeGraph, AssetError> 
 
 pub fn save_node_graph(path: impl AsRef<Path>, graph: &NodeGraph) -> Result<(), AssetError> {
     let encoded = serialize_graph_ron(graph).map_err(|err| AssetError::Encode(err.to_string()))?;
+    fs::write(path, encoded)?;
+    Ok(())
+}
+
+pub fn load_scene_document(path: impl AsRef<Path>) -> Result<SceneDocument, AssetError> {
+    let source = fs::read_to_string(path)?;
+    if ron::from_str::<NodeGraph>(&source).is_ok()
+        && !source.contains("metadata:")
+        && !source.contains("layers:")
+        && !source.contains("objects:")
+    {
+        return Err(AssetError::LegacyGraphFormat);
+    }
+
+    match ron::from_str::<SceneDocument>(&source) {
+        Ok(mut scene) => {
+            if scene.version == 0 {
+                scene.version = CURRENT_SCENE_VERSION;
+            }
+            if scene.layers.is_empty() {
+                scene.layers.push(SceneLayer {
+                    layer_id: 1,
+                    name: "Main".to_string(),
+                    order: 0,
+                    visible: true,
+                    locked: false,
+                });
+            }
+            scene.graph = deserialize_graph_ron(
+                &serialize_graph_ron(&scene.graph)
+                    .map_err(|err| AssetError::SceneParse(err.to_string()))?,
+            )
+            .map_err(|err| AssetError::SceneParse(err.to_string()))?;
+            Ok(scene)
+        }
+        Err(scene_err) => Err(AssetError::SceneParse(scene_err.to_string())),
+    }
+}
+
+pub fn save_scene_document(
+    path: impl AsRef<Path>,
+    scene: &SceneDocument,
+) -> Result<(), AssetError> {
+    let mut scene = scene.clone();
+    scene.version = CURRENT_SCENE_VERSION;
+    scene.graph.version = CURRENT_GRAPH_VERSION;
+    let encoded = ron::to_string(&scene).map_err(|err| AssetError::SceneEncode(err.to_string()))?;
     fs::write(path, encoded)?;
     Ok(())
 }
@@ -373,8 +649,8 @@ pub fn infer_asset_kind(path: &Path) -> AssetKind {
     {
         "png" | "jpg" | "jpeg" | "ktx2" => AssetKind::Texture,
         "wav" | "ogg" | "flac" | "mp3" => AssetKind::Audio,
-        "ron" | "graph" => AssetKind::Graph,
-        "vert" | "frag" | "comp" | "glsl" | "hlsl" => AssetKind::Shader,
+        "ron" | "graph" | "scene" => AssetKind::Graph,
+        "vert" | "frag" | "comp" | "glsl" | "hlsl" | "rhai" => AssetKind::Shader,
         _ => AssetKind::Unknown,
     }
 }
@@ -597,8 +873,9 @@ mod tests {
     use super::*;
     use engine_nodes::{
         ComputeDispatchConfig, Node, NodeExecutionTarget, NodeFallbackPolicy, NodeGpuResourceState,
-        NodeGraph, NodeKind,
+        NodeGraph, NodeKind, NodePayload,
     };
+    use std::collections::BTreeMap;
 
     #[test]
     fn detect_asset_kind() {
@@ -611,8 +888,10 @@ mod tests {
             AssetKind::Shape
         );
         assert_eq!(infer_asset_kind(Path::new("scene.ron")), AssetKind::Graph);
+        assert_eq!(infer_asset_kind(Path::new("scene.scene")), AssetKind::Graph);
         assert_eq!(infer_asset_kind(Path::new("sound.ogg")), AssetKind::Audio);
         assert_eq!(infer_asset_kind(Path::new("post.comp")), AssetKind::Shader);
+        assert_eq!(infer_asset_kind(Path::new("logic.rhai")), AssetKind::Shader);
     }
 
     #[test]
@@ -640,6 +919,7 @@ mod tests {
                 }],
                 shader_entry: None,
                 shader_profile: None,
+                payload: Some(NodePayload::GameplayEvent(Default::default())),
             }],
         };
 
@@ -732,5 +1012,47 @@ mod tests {
         .expect("compile should succeed");
 
         assert_ne!(artifact_a.compile_key, artifact_b.compile_key);
+    }
+
+    #[test]
+    fn scene_roundtrip_and_legacy_detection() {
+        let temp_dir = std::env::temp_dir().join("rusty_engine_scene_asset_test");
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).expect("temp dir should exist");
+
+        let scene_path = temp_dir.join("sample.scene.ron");
+        let graph_path = temp_dir.join("legacy_graph.ron");
+
+        let mut scene = SceneDocument::new_default();
+        scene.metadata.name = "Scene Roundtrip".to_string();
+        scene.graph = NodeGraph {
+            version: CURRENT_GRAPH_VERSION,
+            nodes: vec![Node {
+                id: 7,
+                name: "script".to_string(),
+                kind: NodeKind::ScriptBehavior,
+                target: NodeExecutionTarget::Cpu,
+                dependencies: vec![],
+                settings: BTreeMap::new(),
+                gpu_bindings: vec![],
+                compute: None,
+                fallback_policy: NodeFallbackPolicy::Cpu,
+                gpu_resource_states: vec![],
+                shader_entry: None,
+                shader_profile: None,
+                payload: Some(NodePayload::ScriptBehavior(Default::default())),
+            }],
+        };
+
+        save_scene_document(&scene_path, &scene).expect("scene save should work");
+        let loaded = load_scene_document(&scene_path).expect("scene load should work");
+        assert_eq!(loaded.metadata.name, "Scene Roundtrip");
+        assert_eq!(loaded.graph.nodes.len(), 1);
+
+        save_node_graph(&graph_path, &scene.graph).expect("legacy graph save should work");
+        let legacy = load_scene_document(&graph_path).expect_err("legacy graph should be rejected");
+        assert!(matches!(legacy, AssetError::LegacyGraphFormat));
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 }

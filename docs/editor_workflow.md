@@ -1,90 +1,75 @@
 # Editor Workflow
 
-`engine_editor_app` is the project-facing authoring tool for `rusty_engine`. It combines project management, graph editing, asset browsing, and a live runtime preview.
+`engine_editor_app` is the visual-programming frontend for `rusty_engine`.
+It now edits unified scene documents (`.scene.ron`) that include hierarchy/layers/components plus embedded logic graph.
 
-## Start Here
-
-Run the editor from the workspace root:
+## Start
 
 ```bash
 cargo run -p engine_editor_app
 ```
 
-For a headless startup smoke check:
+Headless startup smoke:
 
 ```bash
-cargo run -p engine_editor_app -- --project . --scene assets/sample_scene.ron --smoke
+cargo run -p engine_editor_app -- --project . --scene assets/sample_scene.scene.ron --smoke
 ```
 
-## Project Manager
+## Scene Authoring
 
-The editor opens with a Project Manager dialog first. Use it to:
+The left panel includes:
 
-- create a new project in a chosen folder,
-- open an existing project root,
-- select an optional scene file,
-- reuse recent projects.
+- **Layers**: add layer, rename, toggle visibility/lock.
+- **Hierarchy**: add/duplicate/delete objects and select active object.
+- **Assets**: inspect assets and drag assets into the graph canvas.
 
-The dialog can be closed without switching projects, but the editor is designed to make a project choice explicit at startup.
+Object editing is in **Inspector -> Object Inspector**:
 
-## Workspace Modes
+- name, parent, layer assignment,
+- transform,
+- optional sprite/collider/camera components,
+- custom properties.
 
-The editor now exposes two authoring workspaces:
+## Logic Authoring
 
-- `Gameplay / Script` for gameplay flow, object setup, and asset references,
-- `Render Pipeline` for render and compute logic.
+Graph editing uses `egui-snarl` with workspace split:
 
-The node palette and right-click canvas menu filter to the active workspace, so you can keep gameplay logic and render logic organized without hiding the underlying graph data.
+- `Gameplay / Script`
+- `Render Pipeline`
 
-## Asset Workflow
+Node authoring supports:
 
-The Assets panel lists discovered project assets and provides a lightweight preview for the selected item.
+- right-click node creation,
+- compatible pin linking,
+- inspector edits for target/fallback/shader metadata,
+- script node metadata (`script_asset`, `script_entry`, `script_phase`),
+- hot recompile into embedded runtime.
 
-Common actions:
+## Runtime Viewport
 
-- click an asset to inspect it,
-- drag an asset into the graph canvas to create an `AssetReference` node,
-- use `Load Graph As Scene` on graph assets,
-- refresh the asset index after adding files on disk.
+Viewport panel now uses backend viewport readback and displays actual runtime frame content.
 
-## Graph Editing
+Controls:
 
-Right-click the graph canvas to add nodes for the active workspace. Nodes can be connected with compatible pins, then edited through the Inspector.
+- `Play` / `Stop` / `Restart` / `Step`
+- `Hot Recompile`
+- viewport pan/zoom and quick object focus.
 
-The current authoring set includes gameplay-oriented nodes such as:
+## Safety and Recovery
 
-- `GameplayEvent`
-- `GameplayFlow`
-- `MathState`
-- `ScriptBehavior`
-- `ObjectInitializer`
+- Transaction-backed history graph with branch checkout.
+- Undo/redo from toolbar or shortcuts.
+- Dirty-state guard before project switch.
+- Autosave recovery modal if `.rusty_engine/editor_autosave.scene.ron` exists.
+- Legacy graph-only `.ron` files are rejected in scene editor flow.
 
-and render-oriented nodes such as:
+## Shortcuts
 
-- `RenderPass`
-- `ComputePass`
-- `BuildExport`
-
-## Runtime Preview
-
-The right side of the editor shows the live runtime preview and simulation state.
-
-- `Play` starts runtime simulation.
-- `Stop` pauses it.
-- `Step` advances one simulation tick while paused.
-- `Hot Recompile` pushes the current graph into the runtime without restarting the editor.
-
-The runtime tick counter only advances while the runtime is actively playing or stepped manually.
-
-## Default Project
-
-Creating a new project seeds basic shape assets and a starter scene so the editor opens with visible content instead of an empty preview.
-
-## Typical Loop
-
-1. Open or create a project.
-2. Pick the workspace that matches the kind of logic you want to edit.
-3. Add nodes or drag assets into the graph.
-4. Adjust node settings in the Inspector.
-5. Recompile and preview the result.
-6. Save the scene when the graph is ready.
+- `Ctrl/Cmd+S`: save scene
+- `Ctrl/Cmd+Z`: undo
+- `Ctrl/Cmd+Shift+Z` or `Ctrl/Cmd+Y`: redo
+- `Ctrl/Cmd+C` / `Ctrl/Cmd+V`: copy/paste selected node/object
+- `Ctrl/Cmd+D`: duplicate selected node/object
+- `Delete`: delete selected node/object
+- `Space`: play/stop toggle
+- `F`: focus selected object in viewport
