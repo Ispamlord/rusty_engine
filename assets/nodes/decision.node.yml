@@ -1,0 +1,19 @@
+version: 1
+type_name: DecisionNode
+display_name: Decision Node
+description: Branches flow/data based on a condition.
+category: Gameplay
+inputs:
+  - name: condition
+    type: { Predefined: Bool }
+    required: true
+  - name: value
+    type: { Predefined: Data }
+    required: false
+outputs:
+  - name: true_branch
+    type: { Predefined: Data }
+  - name: false_branch
+    type: { Predefined: Data }
+default_impl_path: assets/nodes/decision.rhai
+tags: [custom, template, decision]

@@ -1,0 +1,21 @@
+version: 1
+type_name: MathNode
+display_name: Math Node
+description: Numeric operation template.
+category: Gameplay
+inputs:
+  - name: lhs
+    type: { Predefined: F32 }
+    required: true
+  - name: rhs
+    type: { Predefined: F32 }
+    required: true
+  - name: operation
+    type: { Predefined: String }
+    required: false
+    default_value: add
+outputs:
+  - name: result
+    type: { Predefined: F32 }
+default_impl_path: assets/nodes/math.rhai
+tags: [custom, template, math]

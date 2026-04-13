@@ -10,9 +10,9 @@ use engine_assets::{
 };
 use engine_nodes::{
     AssetReferencePayload, BuildExportPayload, CompileDiagnostic, ComputePassPayload,
-    GameplayEventPayload, GameplayFlowPayload, MathStatePayload, Node, NodeExecutionTarget,
-    NodeFallbackPolicy, NodeGraph, NodeId, NodeKind, NodePayload, ObjectInitializerPayload,
-    RenderPassPayload, ScriptBehaviorPayload, CURRENT_GRAPH_VERSION,
+    CustomNodePayload, GameplayEventPayload, GameplayFlowPayload, MathStatePayload, Node,
+    NodeExecutionTarget, NodeFallbackPolicy, NodeGraph, NodeId, NodeKind, NodePayload,
+    ObjectInitializerPayload, RenderPassPayload, ScriptBehaviorPayload, CURRENT_GRAPH_VERSION,
 };
 use engine_render_api::{
     BackendCapabilities, BackendDiagnosticLevel, BackendDiagnostics, BackendKind,
@@ -80,6 +80,7 @@ const GAMEPLAY_WORKSPACE_KINDS: &[NodeKind] = &[
     NodeKind::ScriptBehavior,
     NodeKind::ObjectInitializer,
     NodeKind::AssetReference,
+    NodeKind::Custom,
 ];
 
 const RENDER_WORKSPACE_KINDS: &[NodeKind] = &[
@@ -113,7 +114,8 @@ pub fn node_workspace(kind: NodeKind) -> EditorWorkspaceMode {
         | NodeKind::MathState
         | NodeKind::ScriptBehavior
         | NodeKind::ObjectInitializer
-        | NodeKind::AssetReference => EditorWorkspaceMode::Gameplay,
+        | NodeKind::AssetReference
+        | NodeKind::Custom => EditorWorkspaceMode::Gameplay,
     }
 }
 
@@ -142,6 +144,7 @@ pub fn node_output_pin_type(kind: NodeKind) -> PinTypeCategory {
         NodeKind::RenderPass | NodeKind::BuildExport => PinTypeCategory::Texture,
         NodeKind::ComputePass => PinTypeCategory::Buffer,
         NodeKind::AssetReference => PinTypeCategory::Data,
+        NodeKind::Custom => PinTypeCategory::Data,
     }
 }
 
@@ -155,6 +158,7 @@ pub fn node_input_pin_type(kind: NodeKind) -> PinTypeCategory {
         NodeKind::RenderPass | NodeKind::BuildExport => PinTypeCategory::Texture,
         NodeKind::ComputePass => PinTypeCategory::Buffer,
         NodeKind::AssetReference => PinTypeCategory::Data,
+        NodeKind::Custom => PinTypeCategory::Data,
     }
 }
 
@@ -196,6 +200,7 @@ pub enum EditorAssetKind {
     Audio,
     Shape,
     Graph,
+    NodeConfig,
     Shader,
     Unknown,
 }
@@ -207,6 +212,7 @@ impl From<AssetKind> for EditorAssetKind {
             AssetKind::Audio => Self::Audio,
             AssetKind::Shape => Self::Shape,
             AssetKind::Graph => Self::Graph,
+            AssetKind::NodeConfig => Self::NodeConfig,
             AssetKind::Shader => Self::Shader,
             AssetKind::Unknown => Self::Unknown,
         }
@@ -1625,7 +1631,8 @@ fn build_node_for_kind(id: NodeId, kind: NodeKind, asset: Option<&ProjectAssetEn
             | NodeKind::GameplayEvent
             | NodeKind::MathState
             | NodeKind::ScriptBehavior
-            | NodeKind::ObjectInitializer => NodeExecutionTarget::Cpu,
+            | NodeKind::ObjectInitializer
+            | NodeKind::Custom => NodeExecutionTarget::Cpu,
             NodeKind::AssetReference => NodeExecutionTarget::Hybrid,
             NodeKind::ComputePass | NodeKind::RenderPass | NodeKind::BuildExport => {
                 NodeExecutionTarget::Gpu
@@ -1672,6 +1679,7 @@ fn default_payload_for_kind(kind: NodeKind) -> NodePayload {
         NodeKind::ComputePass => NodePayload::ComputePass(ComputePassPayload::default()),
         NodeKind::AssetReference => NodePayload::AssetReference(AssetReferencePayload::default()),
         NodeKind::BuildExport => NodePayload::BuildExport(BuildExportPayload::default()),
+        NodeKind::Custom => NodePayload::Custom(CustomNodePayload::default()),
     }
 }
 

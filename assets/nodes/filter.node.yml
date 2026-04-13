@@ -1,0 +1,20 @@
+version: 1
+type_name: FilterNode
+display_name: Filter Node
+description: Passes data only when predicate evaluates true.
+category: Gameplay
+inputs:
+  - name: value
+    type: { Predefined: Data }
+    required: true
+  - name: threshold
+    type: { Predefined: F32 }
+    required: false
+    default_value: "0.5"
+outputs:
+  - name: accepted
+    type: { Predefined: Data }
+  - name: rejected
+    type: { Predefined: Data }
+default_impl_path: assets/nodes/filter.rhai
+tags: [custom, template, filter]

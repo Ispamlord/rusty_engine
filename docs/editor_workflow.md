@@ -3,6 +3,8 @@
 `engine_editor_app` is the visual-programming frontend for `rusty_engine`.
 It now edits unified scene documents (`.scene.ron`) that include hierarchy/layers/components plus embedded logic graph.
 
+For a full implementation and feature status snapshot, see [docs/code_status.md](docs/code_status.md).
+
 ## Start
 
 ```bash

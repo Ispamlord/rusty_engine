@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use eframe::egui;
 use engine_app::{EngineApp, EngineAppError, RuntimeDiagnosticsSnapshot};
 use engine_assets::{
-    load_scene_document, Camera2DComponent, Collider2D, SceneComponents, SceneLayer, SceneObject,
-    Sprite2D, Transform2D,
+    load_scene_document, Camera2DComponent, Collider2D, SceneComponents, SceneDocument,
+    SceneLayer, SceneObject, ScriptBinding, Sprite2D, Transform2D,
 };
 use engine_core::EngineConfig;
 use engine_editor::{
@@ -15,8 +15,9 @@ use engine_editor::{
     EditorCommand, EditorError, EditorProjectState, EditorWorkspaceMode, GraphCanvasState,
 };
 use engine_nodes::{
-    Node, NodeExecutionTarget, NodeFallbackPolicy, NodeGraph, NodeId, NodeKind, NodePayload,
-    ScriptBehaviorPayload, CURRENT_GRAPH_VERSION,
+    load_node_config, ComputeDispatchConfig, CustomNodePayload, Node, NodeConfigDocument,
+    NodeExecutionTarget, NodeFallbackPolicy, NodeGraph, NodeId, NodeKind, NodeLibraryScope,
+    NodePayload, ScriptBehaviorPayload, CURRENT_GRAPH_VERSION,
 };
 use thiserror::Error;
 
@@ -77,6 +78,7 @@ impl EditorApp {
         };
 
         let _ = runtime.set_active_scene(project.document.scene.clone())?;
+        runtime.set_frame_pacing_sleep_enabled(false);
 
         let mut canvas = GraphCanvasState::default();
         canvas.rebuild_from_document(&project.document);
@@ -195,6 +197,8 @@ impl EditorApp {
         let project_path = project_path.as_ref();
         fs::create_dir_all(project_path.join("assets"))?;
         self.ensure_default_shape_assets(project_path)?;
+        self.ensure_default_script_assets(project_path)?;
+        self.ensure_default_custom_node_assets(project_path)?;
 
         let scene_path = scene_override
             .unwrap_or_else(|| project_path.join("assets").join("sample_scene.scene.ron"));
@@ -203,7 +207,7 @@ impl EditorApp {
             if let Some(parent) = scene_path.parent() {
                 fs::create_dir_all(parent)?;
             }
-            let scene = engine_assets::SceneDocument::from_graph(Self::default_test_game_graph());
+            let scene = Self::default_test_scene_document();
             engine_assets::save_scene_document(&scene_path, &scene)?;
         }
 
@@ -245,6 +249,90 @@ impl EditorApp {
         Ok(())
     }
 
+    fn ensure_default_script_assets(&self, project_path: &Path) -> Result<(), EditorAppError> {
+        let scripts_dir = project_path.join("assets").join("scripts");
+        fs::create_dir_all(&scripts_dir)?;
+
+        let player_controller = scripts_dir.join("player_controller.rhai");
+        if !player_controller.exists() {
+            fs::write(
+                player_controller,
+                "fn update() {\n    let hero = find_object(\"Hero\");\n    if hero < 0 {\n        return;\n    }\n\n    let speed = get_custom_f32(hero, \"speed\", 2.5);\n    let dx = 0.0;\n    let dy = 0.0;\n\n    if key_down(\"left\") {\n        dx = dx - speed;\n    }\n    if key_down(\"right\") {\n        dx = dx + speed;\n    }\n    if key_down(\"up\") {\n        dy = dy - speed;\n    }\n    if key_down(\"down\") {\n        dy = dy + speed;\n    }\n\n    if dx == 0.0 && dy == 0.0 {\n        return;\n    }\n\n    let moved = move_with_collision(hero, dx, dy);\n    if !moved {\n        emit_event(\"collision\", \"Hero hit obstacle\");\n    }\n}\n",
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn ensure_default_custom_node_assets(&self, project_path: &Path) -> Result<(), EditorAppError> {
+        let nodes_dir = project_path.join("assets").join("nodes");
+        fs::create_dir_all(&nodes_dir)?;
+
+        let node_templates = [
+            (
+                "minimal.node.yml",
+                "version: 1\ntype_name: MinimalNode\ndisplay_name: Minimal Node\ndescription: Basic custom node template for user-authored logic.\ncategory: Gameplay\ninputs:\n  - name: input\n    type: { Predefined: Data }\n    required: false\n    description: Optional input payload.\noutputs:\n  - name: output\n    type: { Predefined: Data }\n    description: Forward or transformed payload.\ndefault_impl_path: assets/nodes/minimal.rhai\ntags: [custom, template, minimal]\n",
+            ),
+            (
+                "math.node.yml",
+                "version: 1\ntype_name: MathNode\ndisplay_name: Math Node\ndescription: Numeric operation template.\ncategory: Gameplay\ninputs:\n  - name: lhs\n    type: { Predefined: F32 }\n    required: true\n  - name: rhs\n    type: { Predefined: F32 }\n    required: true\n  - name: operation\n    type: { Predefined: String }\n    required: false\n    default_value: add\noutputs:\n  - name: result\n    type: { Predefined: F32 }\ndefault_impl_path: assets/nodes/math.rhai\ntags: [custom, template, math]\n",
+            ),
+            (
+                "filter.node.yml",
+                "version: 1\ntype_name: FilterNode\ndisplay_name: Filter Node\ndescription: Passes data only when predicate evaluates true.\ncategory: Gameplay\ninputs:\n  - name: value\n    type: { Predefined: Data }\n    required: true\n  - name: threshold\n    type: { Predefined: F32 }\n    required: false\n    default_value: \"0.5\"\noutputs:\n  - name: accepted\n    type: { Predefined: Data }\n  - name: rejected\n    type: { Predefined: Data }\ndefault_impl_path: assets/nodes/filter.rhai\ntags: [custom, template, filter]\n",
+            ),
+            (
+                "decision.node.yml",
+                "version: 1\ntype_name: DecisionNode\ndisplay_name: Decision Node\ndescription: Branches flow/data based on a condition.\ncategory: Gameplay\ninputs:\n  - name: condition\n    type: { Predefined: Bool }\n    required: true\n  - name: value\n    type: { Predefined: Data }\n    required: false\noutputs:\n  - name: true_branch\n    type: { Predefined: Data }\n  - name: false_branch\n    type: { Predefined: Data }\ndefault_impl_path: assets/nodes/decision.rhai\ntags: [custom, template, decision]\n",
+            ),
+        ];
+
+        for (file_name, content) in node_templates {
+            let path = nodes_dir.join(file_name);
+            if !path.exists() {
+                fs::write(path, content)?;
+            }
+        }
+
+        let node_code_templates = [
+            (
+                "minimal.rhai",
+                "fn execute() {\n    let id = spawn_object(\"CustomLogic\");\n    set_transform(id, 96.0, 96.0, 0.0, 1.0, 1.0);\n    set_sprite(id, \"assets/basic_shapes/circle.ron\", 40, 40);\n    set_custom(id, \"node\", \"minimal\");\n    emit_event(\"custom_node\", \"minimal execute\");\n}\n",
+            ),
+            (
+                "math.rhai",
+                "fn execute() {\n    let id = spawn_object(\"MathLogic\");\n    set_transform(id, 160.0, 96.0, 0.0, 1.0, 1.0);\n    set_sprite(id, \"assets/basic_shapes/square.ron\", 40, 40);\n    set_custom(id, \"node\", \"math\");\n    emit_event(\"custom_node\", \"math execute\");\n}\n",
+            ),
+            (
+                "filter.rhai",
+                "fn execute() {\n    let id = spawn_object(\"FilterLogic\");\n    set_transform(id, 224.0, 96.0, 0.0, 1.0, 1.0);\n    set_sprite(id, \"assets/basic_shapes/triangle.ron\", 40, 40);\n    set_custom(id, \"node\", \"filter\");\n    emit_event(\"custom_node\", \"filter execute\");\n}\n",
+            ),
+            (
+                "decision.rhai",
+                "fn execute() {\n    let id = spawn_object(\"DecisionLogic\");\n    set_transform(id, 288.0, 96.0, 0.0, 1.0, 1.0);\n    set_sprite(id, \"assets/basic_shapes/circle.ron\", 40, 40);\n    set_custom(id, \"node\", \"decision\");\n    emit_event(\"custom_node\", \"decision execute\");\n}\n",
+            ),
+        ];
+
+        for (file_name, content) in node_code_templates {
+            let path = nodes_dir.join(file_name);
+            if !path.exists() {
+                fs::write(path, content)?;
+            }
+        }
+
+        let registry_dir = project_path.join(".rusty_engine");
+        fs::create_dir_all(&registry_dir)?;
+        let registry_path = registry_dir.join("node_registry.yml");
+        if !registry_path.exists() {
+            fs::write(
+                registry_path,
+                "version: 1\ncustom_nodes:\n  - type_name: MinimalNode\n    config_path: assets/nodes/minimal.node.yml\n    impl_path: assets/nodes/minimal.rhai\n    scope: ProjectLocal\n    category: Gameplay\n    description: Minimal editable template node.\n  - type_name: MathNode\n    config_path: assets/nodes/math.node.yml\n    impl_path: assets/nodes/math.rhai\n    scope: ProjectLocal\n    category: Gameplay\n    description: Arithmetic operations.\n  - type_name: FilterNode\n    config_path: assets/nodes/filter.node.yml\n    impl_path: assets/nodes/filter.rhai\n    scope: ProjectLocal\n    category: Gameplay\n    description: Threshold-based filtering.\n  - type_name: DecisionNode\n    config_path: assets/nodes/decision.node.yml\n    impl_path: assets/nodes/decision.rhai\n    scope: ProjectLocal\n    category: Gameplay\n    description: Condition branch template.\n",
+            )?;
+        }
+
+        Ok(())
+    }
+
     fn default_test_game_graph() -> NodeGraph {
         NodeGraph {
             version: CURRENT_GRAPH_VERSION,
@@ -266,34 +354,45 @@ impl EditorApp {
                 },
                 Node {
                     id: 2,
-                    name: "test_logic".to_string(),
-                    kind: NodeKind::GameplayFlow,
+                    name: "player_script".to_string(),
+                    kind: NodeKind::ScriptBehavior,
                     target: NodeExecutionTarget::Cpu,
                     dependencies: vec![1],
-                    settings: BTreeMap::new(),
+                    settings: BTreeMap::from([
+                        (
+                            "script_asset".to_string(),
+                            "assets/scripts/player_controller.rhai".to_string(),
+                        ),
+                        ("script_entry".to_string(), "update".to_string()),
+                        ("script_phase".to_string(), "gameplay".to_string()),
+                    ]),
                     gpu_bindings: vec![],
                     compute: None,
                     fallback_policy: NodeFallbackPolicy::Cpu,
                     gpu_resource_states: vec![],
                     shader_entry: None,
                     shader_profile: None,
-                    payload: Some(NodePayload::GameplayFlow(Default::default())),
+                    payload: Some(NodePayload::ScriptBehavior(ScriptBehaviorPayload {
+                        script_asset: "assets/scripts/player_controller.rhai".to_string(),
+                        entry: "update".to_string(),
+                        frame_phase: "gameplay".to_string(),
+                    })),
                 },
                 Node {
                     id: 3,
-                    name: "test_render".to_string(),
+                    name: "sprite_batch".to_string(),
                     kind: NodeKind::RenderPass,
                     target: NodeExecutionTarget::Gpu,
                     dependencies: vec![2],
                     settings: BTreeMap::from([
-                        ("sprite_count".to_string(), "12".to_string()),
+                        ("sprite_count".to_string(), "8".to_string()),
                         ("blend".to_string(), "alpha".to_string()),
                         ("target_resource".to_string(), "frame_color".to_string()),
                         ("target_width".to_string(), "1280".to_string()),
                         ("target_height".to_string(), "720".to_string()),
                         (
                             "shape_assets".to_string(),
-                            "square,circle,triangle,diamond".to_string(),
+                            "square,circle,triangle".to_string(),
                         ),
                         ("sprite_spacing".to_string(), "72".to_string()),
                     ]),
@@ -305,23 +404,179 @@ impl EditorApp {
                     shader_profile: None,
                     payload: Some(NodePayload::RenderPass(Default::default())),
                 },
-                Node {
-                    id: 4,
-                    name: "script_update".to_string(),
-                    kind: NodeKind::ScriptBehavior,
-                    target: NodeExecutionTarget::Cpu,
-                    dependencies: vec![2],
-                    settings: BTreeMap::new(),
-                    gpu_bindings: vec![],
-                    compute: None,
-                    fallback_policy: NodeFallbackPolicy::Cpu,
-                    gpu_resource_states: vec![],
-                    shader_entry: None,
-                    shader_profile: None,
-                    payload: Some(NodePayload::ScriptBehavior(ScriptBehaviorPayload::default())),
-                },
             ],
         }
+    }
+
+    fn default_test_scene_document() -> SceneDocument {
+        let mut scene = SceneDocument::from_graph(Self::default_test_game_graph());
+        scene.metadata.name = "Starter Gameplay Scene".to_string();
+        scene.metadata.author = "rusty_engine".to_string();
+        scene.metadata.description =
+            "Seeded with player movement and collider obstacles using shape assets.".to_string();
+
+        scene.layers = vec![SceneLayer {
+            layer_id: 1,
+            name: "Main".to_string(),
+            order: 0,
+            visible: true,
+            locked: false,
+        }];
+
+        scene.objects.push(SceneObject {
+            object_id: 2,
+            parent: None,
+            layer_id: 1,
+            name: "Hero".to_string(),
+            tags: vec!["player".to_string()],
+            components: SceneComponents {
+                transform: Transform2D {
+                    x: -220.0,
+                    y: 0.0,
+                    rotation_radians: 0.0,
+                    scale_x: 1.0,
+                    scale_y: 1.0,
+                },
+                sprite: Some(Sprite2D {
+                    texture_asset: "assets/basic_shapes/square.ron".to_string(),
+                    width: 56,
+                    height: 56,
+                    tint_rgba: [255, 255, 255, 255],
+                    layer_order: 10,
+                }),
+                collider: Some(Collider2D {
+                    shape: "circle".to_string(),
+                    radius: 28.0,
+                    width: 56.0,
+                    height: 56.0,
+                    is_sensor: false,
+                }),
+                camera: None,
+                audio: None,
+                script: Some(ScriptBinding {
+                    script_asset: "assets/scripts/player_controller.rhai".to_string(),
+                    entry: "update".to_string(),
+                    frame_phase: "gameplay".to_string(),
+                }),
+                custom_properties: BTreeMap::from([
+                    ("health".to_string(), "100".to_string()),
+                    ("speed".to_string(), "2.5".to_string()),
+                ]),
+                render_effect: None,
+            },
+        });
+
+        scene.objects.push(SceneObject {
+            object_id: 3,
+            parent: None,
+            layer_id: 1,
+            name: "ObstacleSquare".to_string(),
+            tags: vec!["obstacle".to_string()],
+            components: SceneComponents {
+                transform: Transform2D {
+                    x: -40.0,
+                    y: 0.0,
+                    rotation_radians: 0.0,
+                    scale_x: 1.0,
+                    scale_y: 1.0,
+                },
+                sprite: Some(Sprite2D {
+                    texture_asset: "assets/basic_shapes/square.ron".to_string(),
+                    width: 72,
+                    height: 72,
+                    tint_rgba: [255, 255, 255, 255],
+                    layer_order: 9,
+                }),
+                collider: Some(Collider2D {
+                    shape: "box".to_string(),
+                    radius: 0.0,
+                    width: 72.0,
+                    height: 72.0,
+                    is_sensor: false,
+                }),
+                ..SceneComponents::default()
+            },
+        });
+
+        scene.objects.push(SceneObject {
+            object_id: 4,
+            parent: None,
+            layer_id: 1,
+            name: "ObstacleCircle".to_string(),
+            tags: vec!["obstacle".to_string()],
+            components: SceneComponents {
+                transform: Transform2D {
+                    x: 90.0,
+                    y: 0.0,
+                    rotation_radians: 0.0,
+                    scale_x: 1.0,
+                    scale_y: 1.0,
+                },
+                sprite: Some(Sprite2D {
+                    texture_asset: "assets/basic_shapes/circle.ron".to_string(),
+                    width: 64,
+                    height: 64,
+                    tint_rgba: [255, 255, 255, 255],
+                    layer_order: 9,
+                }),
+                collider: Some(Collider2D {
+                    shape: "circle".to_string(),
+                    radius: 32.0,
+                    width: 64.0,
+                    height: 64.0,
+                    is_sensor: false,
+                }),
+                ..SceneComponents::default()
+            },
+        });
+
+        scene.objects.push(SceneObject {
+            object_id: 5,
+            parent: None,
+            layer_id: 1,
+            name: "ObstacleTriangle".to_string(),
+            tags: vec!["obstacle".to_string()],
+            components: SceneComponents {
+                transform: Transform2D {
+                    x: 220.0,
+                    y: 0.0,
+                    rotation_radians: 0.0,
+                    scale_x: 1.0,
+                    scale_y: 1.0,
+                },
+                sprite: Some(Sprite2D {
+                    texture_asset: "assets/basic_shapes/triangle.ron".to_string(),
+                    width: 72,
+                    height: 72,
+                    tint_rgba: [255, 255, 255, 255],
+                    layer_order: 9,
+                }),
+                collider: Some(Collider2D {
+                    shape: "box".to_string(),
+                    radius: 0.0,
+                    width: 72.0,
+                    height: 72.0,
+                    is_sensor: false,
+                }),
+                ..SceneComponents::default()
+            },
+        });
+
+        if let Some(render_node) = scene
+            .graph
+            .nodes
+            .iter_mut()
+            .find(|node| node.kind == NodeKind::RenderPass)
+        {
+            render_node
+                .settings
+                .insert("sprite_count".to_string(), "8".to_string());
+            if let Some(NodePayload::RenderPass(payload)) = render_node.payload.as_mut() {
+                payload.sprite_count = 8;
+            }
+        }
+
+        scene
     }
 }
 
@@ -333,10 +588,29 @@ struct EditorUi {
     inspector_name_buffer: String,
     inspector_setting_key_buffer: String,
     inspector_setting_value_buffer: String,
+    inspector_settings_buffer: BTreeMap<String, String>,
     object_name_buffer: String,
     layer_name_buffer: String,
     object_custom_key_buffer: String,
     object_custom_value_buffer: String,
+    inspector_script_asset_buffer: String,
+    inspector_script_entry_buffer: String,
+    inspector_script_phase_buffer: String,
+    inspector_custom_config_path_buffer: String,
+    inspector_custom_impl_path_buffer: String,
+    inspector_node_kind_buffer: Option<NodeKind>,
+    inspector_node_target_buffer: Option<NodeExecutionTarget>,
+    inspector_node_fallback_buffer: Option<NodeFallbackPolicy>,
+    inspector_shader_entry_buffer: String,
+    inspector_shader_profile_buffer: String,
+    last_inspected_node: Option<NodeId>,
+    object_layer_buffer: Option<u64>,
+    object_parent_buffer: Option<u64>,
+    object_transform_buffer: Transform2D,
+    object_sprite_buffer: Option<Sprite2D>,
+    object_collider_buffer: Option<Collider2D>,
+    object_camera_buffer: Option<Camera2DComponent>,
+    last_inspected_object: Option<u64>,
     project_modal_open: bool,
     project_path_input: String,
     scene_path_input: String,
@@ -378,10 +652,29 @@ impl EditorUi {
             inspector_name_buffer: String::new(),
             inspector_setting_key_buffer: String::new(),
             inspector_setting_value_buffer: String::new(),
+            inspector_settings_buffer: BTreeMap::new(),
             object_name_buffer: String::new(),
             layer_name_buffer: String::new(),
             object_custom_key_buffer: String::new(),
             object_custom_value_buffer: String::new(),
+            inspector_script_asset_buffer: String::new(),
+            inspector_script_entry_buffer: String::new(),
+            inspector_script_phase_buffer: String::new(),
+            inspector_custom_config_path_buffer: String::new(),
+            inspector_custom_impl_path_buffer: String::new(),
+            inspector_node_kind_buffer: None,
+            inspector_node_target_buffer: None,
+            inspector_node_fallback_buffer: None,
+            inspector_shader_entry_buffer: String::new(),
+            inspector_shader_profile_buffer: String::new(),
+            last_inspected_node: None,
+            object_layer_buffer: None,
+            object_parent_buffer: None,
+            object_transform_buffer: Transform2D::default(),
+            object_sprite_buffer: None,
+            object_collider_buffer: None,
+            object_camera_buffer: None,
+            last_inspected_object: None,
             project_modal_open: true,
             project_path_input,
             scene_path_input,
@@ -416,6 +709,21 @@ impl EditorUi {
         self.scene_path_input = self.app.project.scene_path.display().to_string();
         self.scene_path_linked = true;
     }
+    fn describe_custom_node_config(&self, config_path: &str) -> String {
+        let resolved_path = {
+            let path = PathBuf::from(config_path.trim());
+            if path.is_absolute() {
+                path
+            } else {
+                self.app.project.project_root.join(path)
+            }
+        };
+
+        match load_node_config(&resolved_path) {
+            Ok(config) => format_node_config_summary(&config),
+            Err(err) => format!("Failed to load config: {err}"),
+        }
+    }
 
     fn after_project_switch(&mut self) {
         self.selected_node = None;
@@ -425,10 +733,29 @@ impl EditorUi {
         self.inspector_name_buffer.clear();
         self.inspector_setting_key_buffer.clear();
         self.inspector_setting_value_buffer.clear();
+        self.inspector_settings_buffer.clear();
         self.object_name_buffer.clear();
         self.layer_name_buffer.clear();
         self.object_custom_key_buffer.clear();
         self.object_custom_value_buffer.clear();
+        self.inspector_script_asset_buffer.clear();
+        self.inspector_script_entry_buffer.clear();
+        self.inspector_script_phase_buffer.clear();
+        self.inspector_custom_config_path_buffer.clear();
+        self.inspector_custom_impl_path_buffer.clear();
+        self.inspector_node_kind_buffer = None;
+        self.inspector_node_target_buffer = None;
+        self.inspector_node_fallback_buffer = None;
+        self.inspector_shader_entry_buffer.clear();
+        self.inspector_shader_profile_buffer.clear();
+        self.last_inspected_node = None;
+        self.object_layer_buffer = None;
+        self.object_parent_buffer = None;
+        self.object_transform_buffer = Transform2D::default();
+        self.object_sprite_buffer = None;
+        self.object_collider_buffer = None;
+        self.object_camera_buffer = None;
+        self.last_inspected_object = None;
         self.dragged_asset = None;
         self.node_clipboard = None;
         self.object_clipboard = None;
@@ -463,6 +790,175 @@ impl EditorUi {
                 self.app.status_line = format!("command failed: {err}");
             }
         }
+    }
+
+    fn customize_script_node_from_inspector(
+        &mut self,
+        node_id: NodeId,
+        node: &Node,
+        script_asset: &str,
+        script_entry: &str,
+        script_phase: &str,
+    ) -> Result<PathBuf, String> {
+        let project_root = self.app.project.project_root.clone();
+        let source_script_path = resolve_project_asset_path(&project_root, script_asset);
+        let source_script = fs::read_to_string(&source_script_path).unwrap_or_else(|_| {
+            let entry = if script_entry.trim().is_empty() {
+                "update"
+            } else {
+                script_entry.trim()
+            };
+            format!(
+                "fn {entry}() {{\n    // Customize gameplay logic here.\n    // Default phase: {}\n}}\n",
+                script_phase.trim()
+            )
+        });
+
+        let base = sanitize_file_stem(&node.name);
+        let base = if base.is_empty() {
+            format!("node_{}", node_id)
+        } else {
+            base
+        };
+
+        let assets_nodes_rel = PathBuf::from("assets").join("nodes");
+        fs::create_dir_all(project_root.join(&assets_nodes_rel))
+            .map_err(|err| format!("failed to create assets/nodes: {err}"))?;
+
+        let mut suffix = 0_u32;
+        let (impl_rel, config_rel, stem) = loop {
+            let stem = if suffix == 0 {
+                format!("{}_custom", base)
+            } else {
+                format!("{}_custom_{}", base, suffix)
+            };
+
+            let impl_rel = assets_nodes_rel.join(format!("{stem}.rhai"));
+            let config_rel = assets_nodes_rel.join(format!("{stem}.node.yml"));
+            if !project_root.join(&impl_rel).exists() && !project_root.join(&config_rel).exists() {
+                break (impl_rel, config_rel, stem);
+            }
+
+            suffix = suffix.saturating_add(1);
+            if suffix > 1024 {
+                return Err("failed to allocate unique custom asset names".to_string());
+            }
+        };
+
+        let impl_rel_str = path_to_asset_string(&impl_rel);
+        let config_rel_str = path_to_asset_string(&config_rel);
+        let mut type_name = to_pascal_case(&stem);
+        if type_name.is_empty() {
+            type_name = "ScriptCustomNode".to_string();
+        } else {
+            type_name.push_str("Node");
+        }
+
+        let config_yaml = format!(
+            "version: 1\ntype_name: {type_name}\ndisplay_name: {type_name}\ndescription: Generated from ScriptBehavior node for project-local customization.\ncategory: Gameplay\ninputs:\n  - name: input\n    type: {{ Predefined: Data }}\n    required: false\noutputs:\n  - name: output\n    type: {{ Predefined: Data }}\ndefault_impl_path: {impl_rel_str}\ntags: [custom, generated, script]\n"
+        );
+
+        let impl_abs = project_root.join(&impl_rel);
+        let config_abs = project_root.join(&config_rel);
+        fs::write(&impl_abs, source_script)
+            .map_err(|err| format!("failed to write custom script: {err}"))?;
+        fs::write(&config_abs, config_yaml)
+            .map_err(|err| format!("failed to write custom config: {err}"))?;
+
+        let mut commands = Vec::new();
+        if node.kind != NodeKind::Custom {
+            commands.push(EditorCommand::SetNodeKind {
+                node_id,
+                old: node.kind,
+                new: NodeKind::Custom,
+            });
+        }
+
+        for key in ["script_asset", "script_entry", "script_phase"] {
+            if let Some(old) = node.settings.get(key).cloned() {
+                commands.push(EditorCommand::SetNodeSetting {
+                    node_id,
+                    key: key.to_string(),
+                    old: Some(old),
+                    new: None,
+                });
+            }
+        }
+
+        let old_config = node.settings.get("config_path").cloned();
+        if old_config.as_deref() != Some(config_rel_str.as_str()) {
+            commands.push(EditorCommand::SetNodeSetting {
+                node_id,
+                key: "config_path".to_string(),
+                old: old_config,
+                new: Some(config_rel_str.clone()),
+            });
+        }
+
+        let old_impl = node.settings.get("impl_path").cloned();
+        if old_impl.as_deref() != Some(impl_rel_str.as_str()) {
+            commands.push(EditorCommand::SetNodeSetting {
+                node_id,
+                key: "impl_path".to_string(),
+                old: old_impl,
+                new: Some(impl_rel_str.clone()),
+            });
+        }
+
+        let _tx = self.app.project.begin_transaction();
+        let apply = self
+            .app
+            .project
+            .apply_command_batch("script_to_custom", commands);
+        self.app.project.end_transaction();
+
+        if let Err(err) = apply {
+            return Err(format!("conversion command failed: {err}"));
+        }
+
+        let node_mut = self
+            .app
+            .project
+            .document
+            .scene
+            .graph
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == node_id)
+            .ok_or_else(|| "node no longer exists".to_string())?;
+
+        node_mut.kind = NodeKind::Custom;
+        node_mut.settings.remove("script_asset");
+        node_mut.settings.remove("script_entry");
+        node_mut.settings.remove("script_phase");
+        node_mut
+            .settings
+            .insert("config_path".to_string(), config_rel_str.clone());
+        node_mut
+            .settings
+            .insert("impl_path".to_string(), impl_rel_str.clone());
+        node_mut.payload = Some(NodePayload::Custom(CustomNodePayload {
+            type_name,
+            config_path: config_rel_str.clone(),
+            impl_path: Some(impl_rel_str.clone()),
+            library_scope: NodeLibraryScope::ProjectLocal,
+        }));
+        sync_node_payload_from_settings(node_mut);
+
+        self.inspector_node_kind_buffer = Some(NodeKind::Custom);
+        self.inspector_custom_config_path_buffer = config_rel_str;
+        self.inspector_custom_impl_path_buffer = impl_rel_str;
+        self.inspector_settings_buffer = node_mut.settings.clone();
+        self.app.project.dirty = true;
+
+        if let Err(err) = self.app.project.refresh_asset_index() {
+            self.app.status_line = format!("converted node but failed to refresh assets: {err}");
+        }
+
+        self.last_inspected_node = None;
+        self.canvas_refresh_and_compile();
+
+        Ok(impl_abs)
     }
 
     fn parse_optional_scene_path(&self) -> Option<PathBuf> {
@@ -633,7 +1129,7 @@ impl EditorUi {
                     });
             });
 
-        self.project_modal_open = open;
+        self.project_modal_open = open && self.project_modal_open;
     }
 
     fn draw_dirty_guard_modal(&mut self, ctx: &egui::Context) {
@@ -656,6 +1152,8 @@ impl EditorUi {
                             Ok(()) => {
                                 if let Some(action) = self.pending_project_action.take() {
                                     self.run_project_action(action);
+                                } else {
+                                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                                 }
                                 self.dirty_guard_modal_open = false;
                             }
@@ -665,8 +1163,11 @@ impl EditorUi {
                         }
                     }
                     if ui.button("Discard and Continue").clicked() {
+                        self.app.project.dirty = false;
                         if let Some(action) = self.pending_project_action.take() {
                             self.run_project_action(action);
+                        } else {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
                         self.dirty_guard_modal_open = false;
                     }
@@ -676,7 +1177,7 @@ impl EditorUi {
                     }
                 });
             });
-        self.dirty_guard_modal_open = open;
+        self.dirty_guard_modal_open = open && self.dirty_guard_modal_open;
     }
 
     fn draw_autosave_restore_modal(&mut self, ctx: &egui::Context) {
@@ -765,6 +1266,9 @@ impl EditorUi {
     }
 
     fn draw_top_menu(&mut self, ctx: &egui::Context) {
+        let cpu_frame_ms = self.app.runtime.cpu_frame_ms();
+        let fps = fps_from_ms(cpu_frame_ms);
+
         egui::TopBottomPanel::top("editor_top_menu").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.menu_button("File", |ui| {
@@ -907,8 +1411,7 @@ impl EditorUi {
                     self.app.runtime.stop_play_mode();
                 }
                 if ui.button("Restart").clicked() {
-                    self.app.runtime.stop_play_mode();
-                    self.app.runtime.start_play_mode();
+                    self.app.runtime.restart_play_mode();
                 }
                 if ui.button("Step").clicked() {
                     if let Err(err) = self.app.runtime.step_play_frame() {
@@ -929,6 +1432,9 @@ impl EditorUi {
                         Err(err) => self.app.status_line = format!("compile failed: {err}"),
                     }
                 }
+                ui.separator();
+                ui.label(format!("FPS: {:.1}", fps))
+                    .on_hover_text(format!("Estimated from CPU frame time: {:.2} ms", cpu_frame_ms));
                 ui.separator();
                 ui.label(format!("Status: {}", self.app.status_line));
             });
@@ -1204,6 +1710,13 @@ impl EditorUi {
                         ui,
                         &asset_index,
                         &selected_asset_path,
+                        engine_editor::EditorAssetKind::NodeConfig,
+                        "Node Configs",
+                    );
+                    self.draw_asset_kind_section(
+                        ui,
+                        &asset_index,
+                        &selected_asset_path,
                         engine_editor::EditorAssetKind::Shader,
                         "Shaders",
                     );
@@ -1334,8 +1847,10 @@ impl EditorUi {
                 self.draw_object_inspector(ui);
                 ui.separator();
                 ui.heading("Node Inspector");
+                ui.label("Edits are staged here. Click 'Apply Inspector Changes' to commit.");
 
                 let Some(selected) = self.selected_node else {
+                    self.last_inspected_node = None;
                     ui.label("No node selected.");
                     return;
                 };
@@ -1352,6 +1867,7 @@ impl EditorUi {
                     .cloned();
 
                 let Some(node) = maybe_node else {
+                    self.last_inspected_node = None;
                     ui.label("Selected node no longer exists.");
                     return;
                 };
@@ -1367,18 +1883,63 @@ impl EditorUi {
                         "Switch to {} to edit this node.",
                         workspace_label(node_workspace)
                     ));
+                    if ui.button("Switch Workspace").clicked() {
+                        self.app.project.session.workspace_mode = node_workspace;
+                    }
                     return;
                 }
 
                 ui.label(format!("Node #{}", node.id));
-                if self.inspector_name_buffer.is_empty() {
+
+                if self.last_inspected_node != Some(selected) {
                     self.inspector_name_buffer = node.name.clone();
+                    self.inspector_node_kind_buffer = Some(node.kind);
+                    self.inspector_node_target_buffer = Some(node.target);
+                    self.inspector_node_fallback_buffer = Some(node.fallback_policy);
+                    self.inspector_shader_entry_buffer = node.shader_entry.clone().unwrap_or_default();
+                    self.inspector_shader_profile_buffer =
+                        node.shader_profile.clone().unwrap_or_default();
+
+                    self.inspector_script_asset_buffer = node
+                        .settings
+                        .get("script_asset")
+                        .cloned()
+                        .unwrap_or_else(|| "assets/scripts/player_controller.rhai".to_string());
+                    self.inspector_script_entry_buffer = node
+                        .settings
+                        .get("script_entry")
+                        .cloned()
+                        .unwrap_or_else(|| "update".to_string());
+                    self.inspector_script_phase_buffer = node
+                        .settings
+                        .get("script_phase")
+                        .cloned()
+                        .unwrap_or_else(|| "gameplay".to_string());
+                    let custom_payload = node.payload.as_ref().and_then(|payload| match payload {
+                        NodePayload::Custom(payload) => Some(payload),
+                        _ => None,
+                    });
+                    self.inspector_custom_config_path_buffer = node
+                        .settings
+                        .get("config_path")
+                        .cloned()
+                        .or_else(|| custom_payload.map(|payload| payload.config_path.clone()))
+                        .unwrap_or_else(|| "assets/nodes/minimal.node.yml".to_string());
+                    self.inspector_custom_impl_path_buffer = node
+                        .settings
+                        .get("impl_path")
+                        .cloned()
+                        .or_else(|| custom_payload.and_then(|payload| payload.impl_path.clone()))
+                        .unwrap_or_else(|| "assets/nodes/minimal.rhai".to_string());
+                    self.inspector_settings_buffer = seed_node_settings_from_payload(&node);
+
+                    self.last_inspected_node = Some(selected);
                 }
 
                 ui.label("Name");
                 ui.text_edit_singleline(&mut self.inspector_name_buffer);
 
-                let mut kind = node.kind;
+                let mut kind = self.inspector_node_kind_buffer.unwrap_or(node.kind);
                 egui::ComboBox::from_label("Kind")
                     .selected_text(format!("{:?}", kind))
                     .show_ui(ui, |ui| {
@@ -1386,8 +1947,9 @@ impl EditorUi {
                             ui.selectable_value(&mut kind, *option, format!("{:?}", option));
                         }
                     });
+                self.inspector_node_kind_buffer = Some(kind);
 
-                let mut target = node.target;
+                let mut target = self.inspector_node_target_buffer.unwrap_or(node.target);
                 egui::ComboBox::from_label("Target")
                     .selected_text(format!("{:?}", target))
                     .show_ui(ui, |ui| {
@@ -1399,8 +1961,11 @@ impl EditorUi {
                             ui.selectable_value(&mut target, option, format!("{:?}", option));
                         }
                     });
+                self.inspector_node_target_buffer = Some(target);
 
-                let mut fallback = node.fallback_policy;
+                let mut fallback = self
+                    .inspector_node_fallback_buffer
+                    .unwrap_or(node.fallback_policy);
                 egui::ComboBox::from_label("Fallback")
                     .selected_text(format!("{:?}", fallback))
                     .show_ui(ui, |ui| {
@@ -1412,49 +1977,152 @@ impl EditorUi {
                             ui.selectable_value(&mut fallback, option, format!("{:?}", option));
                         }
                     });
+                self.inspector_node_fallback_buffer = Some(fallback);
 
-                let mut shader_entry = node.shader_entry.clone().unwrap_or_default();
-                let mut shader_profile = node.shader_profile.clone().unwrap_or_default();
+                let mut shader_entry = self.inspector_shader_entry_buffer.clone();
+                let mut shader_profile = self.inspector_shader_profile_buffer.clone();
                 ui.label("Shader Entry");
                 ui.text_edit_singleline(&mut shader_entry);
                 ui.label("Shader Profile");
                 ui.text_edit_singleline(&mut shader_profile);
+                self.inspector_shader_entry_buffer = shader_entry.clone();
+                self.inspector_shader_profile_buffer = shader_profile.clone();
 
-                let script_asset = node
-                    .settings
-                    .get("script_asset")
-                    .cloned()
-                    .unwrap_or_else(|| "assets/scripts/player_controller.rhai".to_string());
-                let script_entry = node
-                    .settings
-                    .get("script_entry")
-                    .cloned()
-                    .unwrap_or_else(|| "update".to_string());
-                let script_phase = node
-                    .settings
-                    .get("script_phase")
-                    .cloned()
-                    .unwrap_or_else(|| "gameplay".to_string());
-                let mut script_asset_buffer = script_asset;
-                let mut script_entry_buffer = script_entry;
-                let mut script_phase_buffer = script_phase;
-                if node.kind == NodeKind::ScriptBehavior {
+                let mut script_asset_buffer = self.inspector_script_asset_buffer.clone();
+                let mut script_entry_buffer = self.inspector_script_entry_buffer.clone();
+                let mut script_phase_buffer = self.inspector_script_phase_buffer.clone();
+                let mut custom_config_path_buffer = self.inspector_custom_config_path_buffer.clone();
+                let mut custom_impl_path_buffer = self.inspector_custom_impl_path_buffer.clone();
+                let custom_config_summary = if kind == NodeKind::Custom {
+                    Some(self.describe_custom_node_config(&custom_config_path_buffer))
+                } else {
+                    None
+                };
+                if kind == NodeKind::ScriptBehavior {
                     ui.separator();
                     ui.heading("Script Node");
+                    ui.label("ScriptBehavior executes an external .rhai file.");
+                    ui.label("Edit the script directly or convert this node to Custom for project-local branching.");
                     ui.label("Script Asset");
                     ui.text_edit_singleline(&mut script_asset_buffer);
                     ui.label("Script Entry");
                     ui.text_edit_singleline(&mut script_entry_buffer);
                     ui.label("Frame Phase");
                     ui.text_edit_singleline(&mut script_phase_buffer);
+
+                    ui.horizontal(|ui| {
+                        if ui.button("Edit Script in Code Editor").clicked() {
+                            let script_path = resolve_project_asset_path(
+                                &self.app.project.project_root,
+                                &script_asset_buffer,
+                            );
+                            if let Err(err) = open_in_default_editor(&script_path) {
+                                self.app.status_line =
+                                    format!("Failed to open script editor: {}", err);
+                            }
+                        }
+
+                        if ui.button("Customize As Custom Node").clicked() {
+                            match self.customize_script_node_from_inspector(
+                                selected,
+                                &node,
+                                &script_asset_buffer,
+                                &script_entry_buffer,
+                                &script_phase_buffer,
+                            ) {
+                                Ok(generated_script_path) => {
+                                    if let Err(err) = open_in_default_editor(&generated_script_path)
+                                    {
+                                        self.app.status_line = format!(
+                                            "Converted to custom, but failed to open generated script: {}",
+                                            err
+                                        );
+                                    } else {
+                                        self.app.status_line = format!(
+                                            "Converted to custom node and opened {}",
+                                            generated_script_path.display()
+                                        );
+                                    }
+                                }
+                                Err(err) => {
+                                    self.app.status_line =
+                                        format!("Customize-to-custom failed: {}", err);
+                                }
+                            }
+                        }
+                    });
+                } else if kind == NodeKind::Custom {
+                    ui.separator();
+                    ui.heading("Custom Node");
+                    ui.label("Logic is written in the implementation script (.rhai).");
+                    ui.label("Config Path (.node.yml)");
+                    ui.text_edit_singleline(&mut custom_config_path_buffer);
+                    ui.label("Implementation Path (.rhai)");
+                    ui.text_edit_singleline(&mut custom_impl_path_buffer);
+
+                    if ui.button("Use Selected Node Config Asset").clicked() {
+                        let selected = self.app.project.session.selected_asset.clone();
+                        if let Some(selected_path) = selected {
+                            if let Some(entry) = self
+                                .app
+                                .project
+                                .asset_index
+                                .iter()
+                                .find(|entry| entry.path == selected_path)
+                            {
+                                if entry.kind == engine_editor::EditorAssetKind::NodeConfig {
+                                    custom_config_path_buffer =
+                                        entry.path.display().to_string();
+                                }
+                            }
+                        }
+                    }
+
+                    if ui.button("Edit Implementation in Code Editor").clicked() {
+                        let impl_path = PathBuf::from(custom_impl_path_buffer.trim());
+                        let resolved_path = if impl_path.is_absolute() {
+                            impl_path
+                        } else {
+                            self.app.project.project_root.join(impl_path)
+                        };
+                        if let Err(err) = open_in_default_editor(&resolved_path) {
+                            self.app.status_line = format!("Failed to open editor: {}", err);
+                        }
+                    }
+
+                    ui.separator();
+                    ui.label("Config signature");
+                    if let Some(summary) = &custom_config_summary {
+                        ui.monospace(summary);
+                    }
                 }
 
+                self.inspector_script_asset_buffer = script_asset_buffer.clone();
+                self.inspector_script_entry_buffer = script_entry_buffer.clone();
+                self.inspector_script_phase_buffer = script_phase_buffer.clone();
+                self.inspector_custom_config_path_buffer = custom_config_path_buffer.clone();
+                self.inspector_custom_impl_path_buffer = custom_impl_path_buffer.clone();
+
                 if ui.button("Apply Inspector Changes").clicked() {
-                    let script_changes = if node.kind == NodeKind::ScriptBehavior {
+                    let script_changes = if kind == NodeKind::ScriptBehavior {
                         vec![
                             ("script_asset".to_string(), Some(script_asset_buffer)),
                             ("script_entry".to_string(), Some(script_entry_buffer)),
                             ("script_phase".to_string(), Some(script_phase_buffer)),
+                        ]
+                    } else {
+                        Vec::new()
+                    };
+                    let custom_changes = if kind == NodeKind::Custom {
+                        vec![
+                            (
+                                "config_path".to_string(),
+                                Some(custom_config_path_buffer.clone()),
+                            ),
+                            (
+                                "impl_path".to_string(),
+                                Some(custom_impl_path_buffer.clone()),
+                            ),
                         ]
                     } else {
                         Vec::new()
@@ -1489,6 +2157,11 @@ impl EditorUi {
                         .find(|node| node.id == selected)
                     {
                         node_mut.name = self.inspector_name_buffer.clone();
+                        if let Some(NodePayload::Custom(payload)) = node_mut.payload.as_mut() {
+                            payload.config_path = custom_config_path_buffer.clone();
+                            payload.impl_path = Some(custom_impl_path_buffer.clone());
+                        }
+                        sync_node_payload_from_settings(node_mut);
                         self.app.project.dirty = true;
                     }
 
@@ -1507,20 +2180,60 @@ impl EditorUi {
                         }
                     }
 
+                    for (key, value) in custom_changes {
+                        if let Err(err) = apply_inspector_node_change(
+                            &mut self.app.project,
+                            selected,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            Some((key, value)),
+                        ) {
+                            self.app.status_line = format!("custom metadata update failed: {err}");
+                        }
+                    }
+
+                    if let Some(node_mut) = self
+                        .app
+                        .project
+                        .document
+                        .scene
+                        .graph
+                        .nodes
+                        .iter_mut()
+                        .find(|node| node.id == selected)
+                    {
+                        sync_node_payload_from_settings(node_mut);
+                    }
+
+                    self.last_inspected_node = None;
                     self.canvas_refresh_and_compile();
                 }
 
                 ui.separator();
                 ui.heading("Node Settings");
-                ui.label("Author gameplay/render values as key-value settings.");
+                ui.label("Edit built-in and custom node parameters here, then apply.");
+                ui.label(format!(
+                    "Recommended keys: {}",
+                    recommended_setting_keys(kind)
+                ));
 
                 let mut pending_delete: Option<String> = None;
-                for (key, value) in &node.settings {
+                let mut keys: Vec<String> = self.inspector_settings_buffer.keys().cloned().collect();
+                keys.sort();
+                for key in keys {
+                    let mut value = self
+                        .inspector_settings_buffer
+                        .get(&key)
+                        .cloned()
+                        .unwrap_or_default();
                     ui.horizontal(|ui| {
-                        ui.label(format!("{} = {}", key, value));
-                        if ui.small_button("Edit").clicked() {
-                            self.inspector_setting_key_buffer = key.clone();
-                            self.inspector_setting_value_buffer = value.clone();
+                        ui.label(format!("{}:", key));
+                        let response = ui.text_edit_singleline(&mut value);
+                        if response.changed() {
+                            self.inspector_settings_buffer.insert(key.clone(), value.clone());
                         }
                         if ui.small_button("Delete").clicked() {
                             pending_delete = Some(key.clone());
@@ -1528,29 +2241,15 @@ impl EditorUi {
                     });
                 }
 
-                if node.settings.is_empty() {
+                if self.inspector_settings_buffer.is_empty() {
                     ui.label("No settings yet.");
                 }
 
                 if let Some(key) = pending_delete {
-                    if let Err(err) = apply_inspector_node_change(
-                        &mut self.app.project,
-                        selected,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        Some((key.clone(), None)),
-                    ) {
-                        self.app.status_line = format!("delete setting failed: {err}");
-                    } else {
-                        self.app.status_line = format!("removed setting '{key}'");
-                        if self.inspector_setting_key_buffer == key {
-                            self.inspector_setting_key_buffer.clear();
-                            self.inspector_setting_value_buffer.clear();
-                        }
-                        self.canvas_refresh_and_compile();
+                    self.inspector_settings_buffer.remove(&key);
+                    if self.inspector_setting_key_buffer == key {
+                        self.inspector_setting_key_buffer.clear();
+                        self.inspector_setting_value_buffer.clear();
                     }
                 }
 
@@ -1565,19 +2264,69 @@ impl EditorUi {
                     let value = self.inspector_setting_value_buffer.trim().to_string();
                     if key.is_empty() {
                         self.app.status_line = "setting key is required".to_string();
-                    } else if let Err(err) = apply_inspector_node_change(
-                        &mut self.app.project,
-                        selected,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        Some((key.clone(), Some(value.clone()))),
-                    ) {
-                        self.app.status_line = format!("update setting failed: {err}");
                     } else {
-                        self.app.status_line = format!("updated setting '{key}'");
+                        self.inspector_settings_buffer.insert(key.clone(), value);
+                        self.app.status_line = format!("staged setting '{key}'");
+                    }
+                }
+
+                if ui.button("Apply Node Settings").clicked() {
+                    let existing = node.settings.clone();
+                    let mut had_error = false;
+
+                    for key in existing.keys() {
+                        if !self.inspector_settings_buffer.contains_key(key) {
+                            if let Err(err) = apply_inspector_node_change(
+                                &mut self.app.project,
+                                selected,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                Some((key.clone(), None)),
+                            ) {
+                                had_error = true;
+                                self.app.status_line = format!("delete setting failed: {err}");
+                            }
+                        }
+                    }
+
+                    for (key, value) in &self.inspector_settings_buffer {
+                        let old = existing.get(key);
+                        if old != Some(value) {
+                            if let Err(err) = apply_inspector_node_change(
+                                &mut self.app.project,
+                                selected,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                Some((key.clone(), Some(value.clone()))),
+                            ) {
+                                had_error = true;
+                                self.app.status_line = format!("update setting failed: {err}");
+                            }
+                        }
+                    }
+
+                    if !had_error {
+                        if let Some(node_mut) = self
+                            .app
+                            .project
+                            .document
+                            .scene
+                            .graph
+                            .nodes
+                            .iter_mut()
+                            .find(|node| node.id == selected)
+                        {
+                            sync_node_payload_from_settings(node_mut);
+                            self.app.project.dirty = true;
+                        }
+                        self.app.status_line = "node settings applied".to_string();
+                        self.last_inspected_node = None;
                         self.canvas_refresh_and_compile();
                     }
                 }
@@ -1596,7 +2345,9 @@ impl EditorUi {
 
     fn draw_object_inspector(&mut self, ui: &mut egui::Ui) {
         ui.heading("Object Inspector");
+        ui.label("Edits are staged here. Click 'Apply Object Changes' to commit.");
         let Some(object_id) = self.selected_object else {
+            self.last_inspected_object = None;
             ui.label("No object selected.");
             return;
         };
@@ -1611,19 +2362,27 @@ impl EditorUi {
             .find(|object| object.object_id == object_id)
             .cloned()
         else {
+            self.last_inspected_object = None;
             ui.label("Selected object no longer exists.");
             return;
         };
 
-        if self.object_name_buffer.is_empty() {
+        if self.last_inspected_object != Some(object_id) {
             self.object_name_buffer = object.name.clone();
+            self.object_layer_buffer = Some(object.layer_id);
+            self.object_parent_buffer = object.parent;
+            self.object_transform_buffer = object.components.transform.clone();
+            self.object_sprite_buffer = object.components.sprite.clone();
+            self.object_collider_buffer = object.components.collider.clone();
+            self.object_camera_buffer = object.components.camera.clone();
+            self.last_inspected_object = Some(object_id);
         }
 
         ui.label(format!("Object #{}", object.object_id));
         ui.label("Name");
         ui.text_edit_singleline(&mut self.object_name_buffer);
 
-        let mut selected_layer = object.layer_id;
+        let mut selected_layer = self.object_layer_buffer.unwrap_or(object.layer_id);
         egui::ComboBox::from_label("Layer")
             .selected_text(
                 self.app
@@ -1641,8 +2400,9 @@ impl EditorUi {
                     ui.selectable_value(&mut selected_layer, layer.layer_id, &layer.name);
                 }
             });
+        self.object_layer_buffer = Some(selected_layer);
 
-        let mut selected_parent = object.parent;
+        let mut selected_parent = self.object_parent_buffer;
         egui::ComboBox::from_label("Parent")
             .selected_text(
                 selected_parent
@@ -1661,8 +2421,9 @@ impl EditorUi {
                     }
                 }
             });
+        self.object_parent_buffer = selected_parent;
 
-        let mut transform = object.components.transform.clone();
+        let mut transform = self.object_transform_buffer.clone();
         ui.collapsing("Transform", |ui| {
             ui.add(egui::DragValue::new(&mut transform.x).prefix("x: "));
             ui.add(egui::DragValue::new(&mut transform.y).prefix("y: "));
@@ -1670,8 +2431,9 @@ impl EditorUi {
             ui.add(egui::DragValue::new(&mut transform.scale_x).prefix("sx: "));
             ui.add(egui::DragValue::new(&mut transform.scale_y).prefix("sy: "));
         });
+        self.object_transform_buffer = transform.clone();
 
-        let mut sprite = object.components.sprite.clone();
+        let mut sprite = self.object_sprite_buffer.clone();
         let mut sprite_enabled = sprite.is_some();
         ui.checkbox(&mut sprite_enabled, "Sprite Component");
         if sprite_enabled && sprite.is_none() {
@@ -1694,8 +2456,9 @@ impl EditorUi {
                 ui.add(egui::DragValue::new(&mut sprite_mut.layer_order).prefix("order: "));
             });
         }
+        self.object_sprite_buffer = sprite.clone();
 
-        let mut collider = object.components.collider.clone();
+        let mut collider = self.object_collider_buffer.clone();
         let mut collider_enabled = collider.is_some();
         ui.checkbox(&mut collider_enabled, "Collider Component");
         if collider_enabled && collider.is_none() {
@@ -1719,8 +2482,9 @@ impl EditorUi {
                 ui.checkbox(&mut collider_mut.is_sensor, "Sensor");
             });
         }
+        self.object_collider_buffer = collider.clone();
 
-        let mut camera = object.components.camera.clone();
+        let mut camera = self.object_camera_buffer.clone();
         let mut camera_enabled = camera.is_some();
         ui.checkbox(&mut camera_enabled, "Camera Component");
         if camera_enabled && camera.is_none() {
@@ -1741,6 +2505,7 @@ impl EditorUi {
                 ui.add(egui::DragValue::new(&mut camera_mut.far).prefix("far: "));
             });
         }
+        self.object_camera_buffer = camera.clone();
 
         ui.collapsing("Custom Properties", |ui| {
             for (key, value) in &object.components.custom_properties {
@@ -1868,12 +2633,24 @@ impl EditorUi {
                     self.canvas_refresh_and_compile();
                 }
 
-                if let Some(selected) = output.selected_node {
-                    self.selected_node = Some(selected);
-                    self.app.project.session.selected_node = Some(selected);
+                if output.selected_node != self.selected_node {
+                    self.selected_node = output.selected_node;
+                    self.app.project.session.selected_node = output.selected_node;
                     self.inspector_name_buffer.clear();
                     self.inspector_setting_key_buffer.clear();
                     self.inspector_setting_value_buffer.clear();
+                    self.inspector_settings_buffer.clear();
+                    self.inspector_script_asset_buffer.clear();
+                    self.inspector_script_entry_buffer.clear();
+                    self.inspector_script_phase_buffer.clear();
+                    self.inspector_custom_config_path_buffer.clear();
+                    self.inspector_custom_impl_path_buffer.clear();
+                    self.inspector_node_kind_buffer = None;
+                    self.inspector_node_target_buffer = None;
+                    self.inspector_node_fallback_buffer = None;
+                    self.inspector_shader_entry_buffer.clear();
+                    self.inspector_shader_profile_buffer.clear();
+                    self.last_inspected_node = None;
                 }
 
                 if columns[0].ctx().input(|input| input.pointer.any_released()) {
@@ -1925,13 +2702,18 @@ impl EditorUi {
                     }
                     if ui.button("Zoom +").clicked() {
                         self.app.project.session.viewport.zoom *= 1.1;
+                        self.app.project.session.viewport.zoom =
+                            self.app.project.session.viewport.zoom.clamp(0.05, 20.0);
                     }
                     if ui.button("Zoom -").clicked() {
                         self.app.project.session.viewport.zoom /= 1.1;
+                        self.app.project.session.viewport.zoom =
+                            self.app.project.session.viewport.zoom.clamp(0.05, 20.0);
                     }
                 });
 
-                self.draw_viewport_preview(&mut columns[1]);
+                let viewport_width_height = self.app.runtime.viewport_dimensions();
+                self.draw_viewport_preview(&mut columns[1], viewport_width_height);
 
                 columns[1].label("Quick Object Focus");
                 let objects = self.app.project.document.scene.objects.clone();
@@ -1954,20 +2736,22 @@ impl EditorUi {
                         }
                     });
 
-                let viewport = self.app.runtime.viewport_frame();
+                let runtime_tick = self.app.runtime.runtime_tick();
+                let (viewport_width, viewport_height) = self.app.runtime.viewport_dimensions();
                 let playing = self.app.runtime.is_play_mode();
                 columns[1].horizontal(|ui| {
                     let tick_state = if playing { "running" } else { "paused" };
-                    ui.label(format!(
-                        "Runtime Tick: {} ({tick_state})",
-                        viewport.frame_index
-                    ));
+                    ui.label(format!("Runtime Tick: {} ({tick_state})", runtime_tick));
                     ui.label("(?)")
                         .on_hover_text(
                             "Runtime Tick counts simulation/update steps. It advances only while running Play or when using Step.",
                         );
                 });
-                columns[1].label(format!("Viewport: {}x{}", viewport.width, viewport.height));
+                columns[1].label(format!("Viewport: {}x{}", viewport_width, viewport_height));
+                columns[1].label(format!(
+                    "Readback cadence: every {} frame(s)",
+                    self.app.runtime.viewport_readback_interval_frames()
+                ));
                 columns[1].label(format!(
                     "Pan: ({:.1}, {:.1})  Zoom: {:.2}",
                     self.app.project.session.viewport.pan[0],
@@ -1982,15 +2766,22 @@ impl EditorUi {
         });
     }
 
-    fn draw_viewport_preview(&mut self, ui: &mut egui::Ui) {
-        let viewport = self.app.runtime.viewport_frame();
+    fn draw_viewport_preview(&mut self, ui: &mut egui::Ui, viewport_size: (u32, u32)) {
         let panel_size = egui::vec2(ui.available_width().max(300.0), 300.0);
+        let source = self.app.runtime.viewport_source();
 
-        if let Some(rgba) = viewport.rgba8.clone() {
-            let image = egui::ColorImage::from_rgba_unmultiplied(
-                [viewport.width as usize, viewport.height as usize],
-                &rgba,
-            );
+        let image_data = self.app.runtime.viewport_readback().map(|readback| {
+            (
+                readback.width,
+                readback.height,
+                egui::ColorImage::from_rgba_unmultiplied(
+                    [readback.width as usize, readback.height as usize],
+                    &readback.rgba8,
+                ),
+            )
+        });
+
+        if let Some((width, height, image)) = image_data {
 
             let texture = self.viewport_texture.get_or_insert_with(|| {
                 ui.ctx().load_texture(
@@ -2022,7 +2813,7 @@ impl EditorUi {
             }
             ui.label(format!(
                 "Viewport source: {} ({}x{})",
-                viewport.source, viewport.width, viewport.height
+                source, width, height
             ));
         } else {
             let (rect, _) = ui.allocate_exact_size(panel_size, egui::Sense::hover());
@@ -2035,6 +2826,10 @@ impl EditorUi {
                 egui::FontId::proportional(16.0),
                 egui::Color32::from_rgb(180, 190, 210),
             );
+            ui.label(format!(
+                "Viewport source: {} ({}x{})",
+                source, viewport_size.0, viewport_size.1
+            ));
         }
     }
 
@@ -2174,6 +2969,23 @@ impl EditorUi {
                     egui::Color32::WHITE,
                 );
             }
+            engine_editor::EditorAssetKind::NodeConfig => {
+                painter.rect_filled(swatch, 6.0, egui::Color32::from_rgb(78, 148, 124));
+                painter.text(
+                    swatch.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "IO",
+                    egui::FontId::proportional(20.0),
+                    egui::Color32::WHITE,
+                );
+                painter.text(
+                    rect.left_top() + egui::vec2(12.0, 12.0),
+                    egui::Align2::LEFT_TOP,
+                    "Node config",
+                    egui::FontId::proportional(13.0),
+                    egui::Color32::WHITE,
+                );
+            }
             engine_editor::EditorAssetKind::Unknown => {
                 painter.rect_filled(swatch, 6.0, egui::Color32::from_rgb(96, 96, 96));
                 painter.text(
@@ -2212,6 +3024,10 @@ impl EditorUi {
                     snapshot.frame_timings.cpu_frame_ms,
                     snapshot.frame_timings.gpu_frame_ms,
                     snapshot.frame_timings.node_compile_ms
+                ));
+                ui.label(format!(
+                    "FPS: {:.1}",
+                    fps_from_ms(snapshot.frame_timings.cpu_frame_ms)
                 ));
                 ui.label(format!(
                     "Fallback events: {}, Shader rebuild errors: {}",
@@ -2584,6 +3400,431 @@ impl EditorUi {
     }
 }
 
+fn seed_node_settings_from_payload(node: &Node) -> BTreeMap<String, String> {
+    if !node.settings.is_empty() {
+        return node.settings.clone();
+    }
+
+    let mut settings = BTreeMap::new();
+    match node.payload.as_ref() {
+        Some(NodePayload::GameplayEvent(payload)) => {
+            settings.insert("event_name".to_string(), payload.event_name.clone());
+        }
+        Some(NodePayload::GameplayFlow(payload)) => {
+            settings.insert("condition_key".to_string(), payload.condition_key.clone());
+            settings.insert("expected_value".to_string(), payload.expected_value.clone());
+        }
+        Some(NodePayload::MathState(payload)) => {
+            settings.insert("operation".to_string(), payload.operation.clone());
+            settings.insert("lhs".to_string(), payload.lhs.to_string());
+            settings.insert("rhs".to_string(), payload.rhs.to_string());
+            settings.insert("output_key".to_string(), payload.output_key.clone());
+        }
+        Some(NodePayload::ObjectInitializer(payload)) => {
+            settings.insert("object_name".to_string(), payload.object_name.clone());
+            settings.insert("layer_id".to_string(), payload.layer_id.to_string());
+            settings.insert("x".to_string(), payload.x.to_string());
+            settings.insert("y".to_string(), payload.y.to_string());
+        }
+        Some(NodePayload::ScriptBehavior(payload)) => {
+            settings.insert("script_asset".to_string(), payload.script_asset.clone());
+            settings.insert("script_entry".to_string(), payload.entry.clone());
+            settings.insert("script_phase".to_string(), payload.frame_phase.clone());
+        }
+        Some(NodePayload::RenderPass(payload)) => {
+            settings.insert("target_resource".to_string(), payload.target_resource.clone());
+            settings.insert("target_width".to_string(), payload.target_width.to_string());
+            settings.insert("target_height".to_string(), payload.target_height.to_string());
+            settings.insert("sprite_count".to_string(), payload.sprite_count.to_string());
+            settings.insert("blend".to_string(), payload.blend.clone());
+        }
+        Some(NodePayload::ComputePass(payload)) => {
+            settings.insert("shader".to_string(), payload.shader.clone());
+            settings.insert("dispatch_x".to_string(), payload.dispatch[0].to_string());
+            settings.insert("dispatch_y".to_string(), payload.dispatch[1].to_string());
+            settings.insert("dispatch_z".to_string(), payload.dispatch[2].to_string());
+            settings.insert("read_resources".to_string(), payload.reads.join(","));
+            settings.insert("write_resources".to_string(), payload.writes.join(","));
+        }
+        Some(NodePayload::AssetReference(payload)) => {
+            settings.insert("asset_path".to_string(), payload.asset_path.clone());
+            settings.insert("asset_kind".to_string(), payload.asset_kind.clone());
+        }
+        Some(NodePayload::BuildExport(payload)) => {
+            settings.insert("target".to_string(), payload.target.clone());
+        }
+        Some(NodePayload::Custom(payload)) => {
+            settings.insert("config_path".to_string(), payload.config_path.clone());
+            if let Some(impl_path) = payload.impl_path.as_ref() {
+                settings.insert("impl_path".to_string(), impl_path.clone());
+            }
+        }
+        None => {}
+    }
+
+    settings
+}
+
+fn sync_node_payload_from_settings(node: &mut Node) {
+    match node.kind {
+        NodeKind::GameplayEvent => {
+            let mut payload = node
+                .payload
+                .as_ref()
+                .and_then(|payload| match payload {
+                    NodePayload::GameplayEvent(payload) => Some(payload.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            if let Some(value) = node.settings.get("event_name") {
+                payload.event_name = value.clone();
+            }
+            node.payload = Some(NodePayload::GameplayEvent(payload));
+        }
+        NodeKind::GameplayFlow => {
+            let mut payload = node
+                .payload
+                .as_ref()
+                .and_then(|payload| match payload {
+                    NodePayload::GameplayFlow(payload) => Some(payload.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            if let Some(value) = node.settings.get("condition_key") {
+                payload.condition_key = value.clone();
+            }
+            if let Some(value) = node.settings.get("expected_value") {
+                payload.expected_value = value.clone();
+            }
+            node.payload = Some(NodePayload::GameplayFlow(payload));
+        }
+        NodeKind::MathState => {
+            let mut payload = node
+                .payload
+                .as_ref()
+                .and_then(|payload| match payload {
+                    NodePayload::MathState(payload) => Some(payload.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            if let Some(value) = node.settings.get("operation") {
+                payload.operation = value.clone();
+            }
+            payload.lhs = parse_f32_setting(node.settings.get("lhs"), payload.lhs);
+            payload.rhs = parse_f32_setting(node.settings.get("rhs"), payload.rhs);
+            if let Some(value) = node.settings.get("output_key") {
+                payload.output_key = value.clone();
+            }
+            node.payload = Some(NodePayload::MathState(payload));
+        }
+        NodeKind::ObjectInitializer => {
+            let mut payload = node
+                .payload
+                .as_ref()
+                .and_then(|payload| match payload {
+                    NodePayload::ObjectInitializer(payload) => Some(payload.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            if let Some(value) = node.settings.get("object_name") {
+                payload.object_name = value.clone();
+            }
+            payload.layer_id = parse_u64_setting(node.settings.get("layer_id"), payload.layer_id);
+            payload.x = parse_f32_setting(node.settings.get("x"), payload.x);
+            payload.y = parse_f32_setting(node.settings.get("y"), payload.y);
+            node.payload = Some(NodePayload::ObjectInitializer(payload));
+        }
+        NodeKind::ScriptBehavior => {
+            let mut payload = node
+                .payload
+                .as_ref()
+                .and_then(|payload| match payload {
+                    NodePayload::ScriptBehavior(payload) => Some(payload.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            if let Some(value) = node.settings.get("script_asset") {
+                payload.script_asset = value.clone();
+            }
+            if let Some(value) = node.settings.get("script_entry") {
+                payload.entry = value.clone();
+            }
+            if let Some(value) = node.settings.get("script_phase") {
+                payload.frame_phase = value.clone();
+            }
+            node.payload = Some(NodePayload::ScriptBehavior(payload));
+        }
+        NodeKind::RenderPass => {
+            let mut payload = node
+                .payload
+                .as_ref()
+                .and_then(|payload| match payload {
+                    NodePayload::RenderPass(payload) => Some(payload.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            if let Some(value) = node.settings.get("target_resource") {
+                payload.target_resource = value.clone();
+            }
+            payload.target_width = parse_u32_setting(node.settings.get("target_width"), payload.target_width);
+            payload.target_height = parse_u32_setting(node.settings.get("target_height"), payload.target_height);
+            payload.sprite_count = parse_u32_setting(node.settings.get("sprite_count"), payload.sprite_count);
+            if let Some(value) = node.settings.get("blend") {
+                payload.blend = value.clone();
+            }
+            node.payload = Some(NodePayload::RenderPass(payload));
+        }
+        NodeKind::ComputePass => {
+            let mut payload = node
+                .payload
+                .as_ref()
+                .and_then(|payload| match payload {
+                    NodePayload::ComputePass(payload) => Some(payload.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            if let Some(value) = node.settings.get("shader") {
+                payload.shader = value.clone();
+            }
+            let dispatch_x = parse_u32_setting(node.settings.get("dispatch_x"), payload.dispatch[0]);
+            let dispatch_y = parse_u32_setting(node.settings.get("dispatch_y"), payload.dispatch[1]);
+            let dispatch_z = parse_u32_setting(node.settings.get("dispatch_z"), payload.dispatch[2]);
+            payload.dispatch = [dispatch_x, dispatch_y, dispatch_z];
+            payload.reads = parse_csv_setting(node.settings.get("read_resources"));
+            payload.writes = parse_csv_setting(node.settings.get("write_resources"));
+            node.compute = Some(ComputeDispatchConfig {
+                x: dispatch_x,
+                y: dispatch_y,
+                z: dispatch_z,
+            });
+            node.payload = Some(NodePayload::ComputePass(payload));
+        }
+        NodeKind::AssetReference => {
+            let mut payload = node
+                .payload
+                .as_ref()
+                .and_then(|payload| match payload {
+                    NodePayload::AssetReference(payload) => Some(payload.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            if let Some(value) = node.settings.get("asset_path") {
+                payload.asset_path = value.clone();
+            }
+            if let Some(value) = node.settings.get("asset_kind") {
+                payload.asset_kind = value.clone();
+            }
+            node.payload = Some(NodePayload::AssetReference(payload));
+        }
+        NodeKind::BuildExport => {
+            let mut payload = node
+                .payload
+                .as_ref()
+                .and_then(|payload| match payload {
+                    NodePayload::BuildExport(payload) => Some(payload.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            if let Some(value) = node.settings.get("target") {
+                payload.target = value.clone();
+            }
+            node.payload = Some(NodePayload::BuildExport(payload));
+        }
+        NodeKind::Custom => {
+            let mut payload = node
+                .payload
+                .as_ref()
+                .and_then(|payload| match payload {
+                    NodePayload::Custom(payload) => Some(payload.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            if let Some(value) = node.settings.get("config_path") {
+                payload.config_path = value.clone();
+            }
+            if let Some(value) = node.settings.get("impl_path") {
+                payload.impl_path = Some(value.clone());
+            }
+            node.payload = Some(NodePayload::Custom(payload));
+        }
+    }
+}
+
+fn parse_u32_setting(value: Option<&String>, fallback: u32) -> u32 {
+    value
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .unwrap_or(fallback)
+}
+
+fn parse_u64_setting(value: Option<&String>, fallback: u64) -> u64 {
+    value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(fallback)
+}
+
+fn parse_f32_setting(value: Option<&String>, fallback: f32) -> f32 {
+    value
+        .and_then(|value| value.trim().parse::<f32>().ok())
+        .unwrap_or(fallback)
+}
+
+fn parse_csv_setting(value: Option<&String>) -> Vec<String> {
+    value
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn recommended_setting_keys(kind: NodeKind) -> &'static str {
+    match kind {
+        NodeKind::GameplayEvent => "event_name",
+        NodeKind::GameplayFlow => "condition_key, expected_value",
+        NodeKind::MathState => "operation, lhs, rhs, output_key",
+        NodeKind::ScriptBehavior => "script_asset, script_entry, script_phase",
+        NodeKind::ObjectInitializer => "object_name, layer_id, x, y",
+        NodeKind::RenderPass => {
+            "target_resource, target_width, target_height, sprite_count, blend"
+        }
+        NodeKind::ComputePass => {
+            "shader, dispatch_x, dispatch_y, dispatch_z, read_resources, write_resources"
+        }
+        NodeKind::AssetReference => "asset_path, asset_kind",
+        NodeKind::BuildExport => "target",
+        NodeKind::Custom => "config_path, impl_path",
+    }
+}
+
+fn fps_from_ms(cpu_frame_ms: f32) -> f32 {
+    if cpu_frame_ms.is_finite() && cpu_frame_ms > 0.0 {
+        1000.0 / cpu_frame_ms
+    } else {
+        0.0
+    }
+}
+
+fn resolve_project_asset_path(project_root: &Path, raw_path: &str) -> PathBuf {
+    let path = PathBuf::from(raw_path.trim());
+    if path.is_absolute() {
+        path
+    } else {
+        project_root.join(path)
+    }
+}
+
+fn path_to_asset_string(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn sanitize_file_stem(raw: &str) -> String {
+    let mut result = String::new();
+    let mut previous_sep = false;
+
+    for ch in raw.chars() {
+        let lower = ch.to_ascii_lowercase();
+        if lower.is_ascii_alphanumeric() {
+            result.push(lower);
+            previous_sep = false;
+        } else if !previous_sep {
+            result.push('_');
+            previous_sep = true;
+        }
+    }
+
+    result.trim_matches('_').to_string()
+}
+
+fn to_pascal_case(raw: &str) -> String {
+    raw.split('_')
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| {
+            let mut chars = segment.chars();
+            match chars.next() {
+                Some(first) => {
+                    let mut out = String::new();
+                    out.push(first.to_ascii_uppercase());
+                    out.push_str(chars.as_str());
+                    out
+                }
+                None => String::new(),
+            }
+        })
+        .collect::<String>()
+}
+
+fn open_in_default_editor(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("cmd")
+            .args(&["/C", "start"])
+            .arg(path)
+            .spawn()?;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg("-a")
+            .arg("Visual Studio Code")
+            .arg(path)
+            .spawn()?;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(path)
+            .spawn()?;
+    }
+
+    Ok(())
+}
+
+fn format_node_config_summary(config: &NodeConfigDocument) -> String {
+    let mut lines = Vec::new();
+    lines.push(format!("type: {}", config.type_name));
+
+    if !config.display_name.is_empty() {
+        lines.push(format!("display: {}", config.display_name));
+    }
+
+    if let Some(description) = &config.description {
+        if !description.is_empty() {
+            lines.push(format!("description: {}", description));
+        }
+    }
+
+    lines.push("inputs:".to_string());
+    if config.inputs.is_empty() {
+        lines.push("  - none".to_string());
+    } else {
+        for input in &config.inputs {
+            lines.push(format!(
+                "  - {}: {:?}{}",
+                input.name,
+                input.type_descriptor,
+                if input.required { " (required)" } else { "" }
+            ));
+        }
+    }
+
+    lines.push("outputs:".to_string());
+    if config.outputs.is_empty() {
+        lines.push("  - none".to_string());
+    } else {
+        for output in &config.outputs {
+            lines.push(format!("  - {}: {:?}", output.name, output.type_descriptor));
+        }
+    }
+
+    lines.join("\n")
+}
+
 impl eframe::App for EditorUi {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_shortcuts(ctx);
@@ -2604,6 +3845,21 @@ impl eframe::App for EditorUi {
 
         self.draw_autosave_restore_modal(ctx);
         self.draw_dirty_guard_modal(ctx);
+
+        let (left, right, up, down) = ctx.input(|input| {
+            (
+                input.key_down(egui::Key::ArrowLeft) || input.key_down(egui::Key::A),
+                input.key_down(egui::Key::ArrowRight) || input.key_down(egui::Key::D),
+                input.key_down(egui::Key::ArrowUp) || input.key_down(egui::Key::W),
+                input.key_down(egui::Key::ArrowDown) || input.key_down(egui::Key::S),
+            )
+        });
+        self.app.runtime.set_keyboard_input(left, right, up, down);
+        self.app.runtime.set_viewport_camera(
+            self.app.project.session.viewport.pan[0],
+            self.app.project.session.viewport.pan[1],
+            self.app.project.session.viewport.zoom,
+        );
 
         if let Err(err) = self.app.runtime.run_for_frames(1) {
             self.app.status_line = format!("runtime frame failed: {err}");

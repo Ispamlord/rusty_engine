@@ -52,6 +52,7 @@ pub struct Dx12Backend {
     active_surface: Option<SurfaceHandle>,
     surface_config: Option<SurfaceConfig>,
     diagnostics: BackendDiagnostics,
+    last_recorded_graph: Option<RenderGraph>,
     last_viewport_readback: Option<ViewportReadback>,
 
     #[cfg(target_os = "windows")]
@@ -75,6 +76,7 @@ impl Dx12Backend {
             active_surface: None,
             surface_config: None,
             diagnostics: BackendDiagnostics::new(BackendKind::Dx12),
+            last_recorded_graph: None,
             last_viewport_readback: None,
             #[cfg(target_os = "windows")]
             native: None,
@@ -178,6 +180,7 @@ impl Dx12Backend {
         self.frame_start = None;
         self.active_surface = None;
         self.surface_config = None;
+        self.last_recorded_graph = None;
         self.last_viewport_readback = None;
 
         Ok(())
@@ -201,12 +204,15 @@ impl Dx12Backend {
 
         for pass in &graph.passes {
             if let RenderGraphPass::Render(render) = pass {
+                let zoom = render.camera.zoom.max(0.05);
                 for batch in &render.batches {
                     for sprite in &batch.sprites {
-                        let cx = (width as f32 * 0.5 + sprite.x).round() as i32;
-                        let cy = (height as f32 * 0.5 + sprite.y).round() as i32;
-                        let hw = (sprite.width * 0.5).round().max(1.0) as i32;
-                        let hh = (sprite.height * 0.5).round().max(1.0) as i32;
+                        let cx = (width as f32 * 0.5 + (sprite.x + render.camera.x) * zoom)
+                            .round() as i32;
+                        let cy = (height as f32 * 0.5 + (sprite.y + render.camera.y) * zoom)
+                            .round() as i32;
+                        let hw = (sprite.width * 0.5 * zoom).round().max(1.0) as i32;
+                        let hh = (sprite.height * 0.5 * zoom).round().max(1.0) as i32;
                         let tint = [
                             (sprite.tint[0].clamp(0.0, 1.0) * 255.0) as u8,
                             (sprite.tint[1].clamp(0.0, 1.0) * 255.0) as u8,
@@ -217,8 +223,24 @@ impl Dx12Backend {
                         let max_x = (cx + hw).min(width as i32 - 1);
                         let min_y = (cy - hh).max(0);
                         let max_y = (cy + hh).min(height as i32 - 1);
+                        let shape = sprite.texture.0 % 3;
+                        let hwf = hw.max(1) as f32;
+                        let hhf = hh.max(1) as f32;
                         for py in min_y..=max_y {
                             for px in min_x..=max_x {
+                                let nx = (px - cx) as f32 / hwf;
+                                let ny = (py - cy) as f32 / hhf;
+                                let inside = match shape {
+                                    1 => nx * nx + ny * ny <= 1.0,
+                                    2 => {
+                                        let t = ((ny + 1.0) * 0.5).clamp(0.0, 1.0);
+                                        nx.abs() <= t
+                                    }
+                                    _ => true,
+                                };
+                                if !inside {
+                                    continue;
+                                }
                                 let idx = ((py as u32 * width + px as u32) * 4) as usize;
                                 rgba[idx] = tint[0];
                                 rgba[idx + 1] = tint[1];
@@ -350,6 +372,8 @@ impl GraphicsBackend for Dx12Backend {
         self.active_surface = Some(handle);
         self.surface_config = Some(config);
         self.diagnostics.supports_surface = false;
+        self.last_recorded_graph = None;
+        self.last_viewport_readback = None;
 
         if config.headless {
             self.record_event(
@@ -559,7 +583,8 @@ impl GraphicsBackend for Dx12Backend {
             });
         }
 
-        self.last_viewport_readback = self.synthesize_viewport(graph);
+        self.last_recorded_graph = Some(graph.clone());
+        self.last_viewport_readback = None;
 
         Ok(())
     }
@@ -620,6 +645,11 @@ impl GraphicsBackend for Dx12Backend {
     }
 
     fn readback_viewport(&mut self) -> Result<Option<ViewportReadback>, BackendError> {
+        if self.last_viewport_readback.is_none() {
+            if let Some(graph) = self.last_recorded_graph.as_ref() {
+                self.last_viewport_readback = self.synthesize_viewport(graph);
+            }
+        }
         Ok(self.last_viewport_readback.clone())
     }
 

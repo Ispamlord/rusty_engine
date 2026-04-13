@@ -1,0 +1,26 @@
+version: 1
+custom_nodes:
+  - type_name: MinimalNode
+    config_path: assets/nodes/minimal.node.yml
+    impl_path: assets/nodes/minimal.rhai
+    scope: ProjectLocal
+    category: Gameplay
+    description: Minimal editable template node.
+  - type_name: MathNode
+    config_path: assets/nodes/math.node.yml
+    impl_path: assets/nodes/math.rhai
+    scope: ProjectLocal
+    category: Gameplay
+    description: Arithmetic operations.
+  - type_name: FilterNode
+    config_path: assets/nodes/filter.node.yml
+    impl_path: assets/nodes/filter.rhai
+    scope: ProjectLocal
+    category: Gameplay
+    description: Threshold-based filtering.
+  - type_name: DecisionNode
+    config_path: assets/nodes/decision.node.yml
+    impl_path: assets/nodes/decision.rhai
+    scope: ProjectLocal
+    category: Gameplay
+    description: Condition branch template.

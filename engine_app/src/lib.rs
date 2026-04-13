@@ -1,5 +1,7 @@
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -27,10 +29,12 @@ use engine_platform::{
 };
 use engine_render_api::{
     BackendCapabilities, BackendDiagnosticEvent, BackendDiagnosticLevel, BackendDiagnostics,
-    BackendError, BackendKind, GraphicsBackend, RenderGraph, RenderGraphPass, SurfaceConfig,
-    SurfaceHandle, SurfaceWindowHandles, ViewportReadback,
+    BackendError, BackendKind, BlendMode, Camera2d, GraphicsBackend, RenderGraph,
+    RenderGraphPass, SpriteBatchCommand, SpriteInstance, SurfaceConfig, SurfaceHandle,
+    SurfaceWindowHandles, TextureHandle, ViewportReadback,
 };
 use rhai::{Dynamic, Engine as RhaiEngine, Scope, AST};
+use rhai::Map as RhaiMap;
 use thiserror::Error;
 use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::window::Window;
@@ -67,12 +71,76 @@ struct GraphRuntimeState {
 #[derive(Resource, Default)]
 struct FrameCounter(pub u64);
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RuntimeInputState {
+    left: bool,
+    right: bool,
+    up: bool,
+    down: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ViewportReadbackBalancer {
+    interval_frames: u32,
+    frame_cursor: u32,
+}
+
+impl Default for ViewportReadbackBalancer {
+    fn default() -> Self {
+        Self {
+            interval_frames: 1,
+            frame_cursor: 0,
+        }
+    }
+}
+
+impl ViewportReadbackBalancer {
+    fn should_capture(&mut self) -> bool {
+        self.frame_cursor = self.frame_cursor.wrapping_add(1);
+        self.frame_cursor % self.interval_frames.max(1) == 0
+    }
+
+    fn update_from_frame_time(&mut self, frame_ms: f32, target_ms: f32) {
+        if target_ms <= 0.0 {
+            return;
+        }
+
+        let previous = self.interval_frames;
+        if frame_ms > target_ms * 1.15 {
+            self.interval_frames = (self.interval_frames + 1).min(4);
+        } else if frame_ms < target_ms * 0.75 {
+            self.interval_frames = self.interval_frames.saturating_sub(1).max(1);
+        }
+
+        if self.interval_frames != previous && self.frame_cursor >= self.interval_frames {
+            self.frame_cursor %= self.interval_frames;
+        }
+    }
+
+    fn interval_frames(self) -> u32 {
+        self.interval_frames.max(1)
+    }
+}
+
+impl RuntimeInputState {
+    fn key_down(self, key: &str) -> bool {
+        match key.trim().to_ascii_lowercase().as_str() {
+            "left" | "a" | "arrowleft" => self.left,
+            "right" | "d" | "arrowright" => self.right,
+            "up" | "w" | "arrowup" => self.up,
+            "down" | "s" | "arrowdown" => self.down,
+            _ => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct ScriptHostState {
     scene: Option<SceneDocument>,
     events: Vec<String>,
     logs: Vec<String>,
     next_object_id: u64,
+    input: RuntimeInputState,
 }
 
 struct ScriptRuntime {
@@ -102,6 +170,109 @@ impl ScriptHostState {
     }
 }
 
+fn find_object_id_by_name(scene: &SceneDocument, name: &str) -> Option<u64> {
+    scene
+        .objects
+        .iter()
+        .find(|object| object.name == name)
+        .map(|object| object.object_id)
+}
+
+fn collider_half_extents(collider: &Collider2D) -> (f32, f32) {
+    if collider.shape.eq_ignore_ascii_case("circle") {
+        let radius = if collider.radius > 0.0 {
+            collider.radius
+        } else {
+            collider.width.abs().max(collider.height.abs()) * 0.5
+        }
+        .max(0.5);
+        (radius, radius)
+    } else {
+        let half_w = if collider.width.abs() > 0.0 {
+            collider.width.abs() * 0.5
+        } else {
+            collider.radius.max(0.5)
+        };
+        let half_h = if collider.height.abs() > 0.0 {
+            collider.height.abs() * 0.5
+        } else {
+            collider.radius.max(0.5)
+        };
+        (half_w.max(0.5), half_h.max(0.5))
+    }
+}
+
+fn aabb_overlaps(
+    ax: f32,
+    ay: f32,
+    ahx: f32,
+    ahy: f32,
+    bx: f32,
+    by: f32,
+    bhx: f32,
+    bhy: f32,
+) -> bool {
+    (ax - bx).abs() <= ahx + bhx && (ay - by).abs() <= ahy + bhy
+}
+
+fn move_object_with_collision(scene: &mut SceneDocument, object_id: u64, dx: f32, dy: f32) -> bool {
+    let Some(index) = scene
+        .objects
+        .iter()
+        .position(|object| object.object_id == object_id)
+    else {
+        return false;
+    };
+
+    let current_transform = scene.objects[index].components.transform.clone();
+    let Some(collider) = scene.objects[index].components.collider.clone() else {
+        scene.objects[index].components.transform.x += dx;
+        scene.objects[index].components.transform.y += dy;
+        return true;
+    };
+
+    let next_x = current_transform.x + dx;
+    let next_y = current_transform.y + dy;
+    let (self_hx, self_hy) = collider_half_extents(&collider);
+
+    let blocked = scene.objects.iter().enumerate().any(|(other_index, other)| {
+        if other_index == index {
+            return false;
+        }
+        let Some(other_collider) = &other.components.collider else {
+            return false;
+        };
+        if other_collider.is_sensor {
+            return false;
+        }
+
+        let (other_hx, other_hy) = collider_half_extents(other_collider);
+        aabb_overlaps(
+            next_x,
+            next_y,
+            self_hx,
+            self_hy,
+            other.components.transform.x,
+            other.components.transform.y,
+            other_hx,
+            other_hy,
+        )
+    });
+
+    if blocked {
+        return false;
+    }
+
+    scene.objects[index].components.transform.x = next_x;
+    scene.objects[index].components.transform.y = next_y;
+    true
+}
+
+fn normalize_legacy_rhai_source(source: &str) -> String {
+    // Older seeded templates used `let mut`, which Rhai does not support.
+    source.replace("let mut ", "let ")
+}
+
 impl ScriptRuntime {
     fn new() -> Self {
         let host_state = Arc::new(Mutex::new(ScriptHostState {
@@ -109,6 +280,7 @@ impl ScriptRuntime {
             events: Vec::new(),
             logs: Vec::new(),
             next_object_id: 1000,
+            input: RuntimeInputState::default(),
         }));
 
         let mut engine = RhaiEngine::new();
@@ -183,6 +355,26 @@ impl ScriptRuntime {
         {
             let host = host_state.clone();
             engine.register_fn(
+                "set_transform",
+                move |id: i64, x: f64, y: f64, rot: f64, sx: f64, sy: f64| {
+                    if let Ok(mut state) = host.lock() {
+                        state.with_object_mut(id as u64, |object| {
+                            object.components.transform = Transform2D {
+                                x: x as f32,
+                                y: y as f32,
+                                rotation_radians: rot as f32,
+                                scale_x: sx as f32,
+                                scale_y: sy as f32,
+                            };
+                        });
+                    }
+                },
+            );
+        }
+
+        {
+            let host = host_state.clone();
+            engine.register_fn(
                 "set_sprite",
                 move |id: i64, texture: &str, width: i64, height: i64| {
                     if let Ok(mut state) = host.lock() {
@@ -241,9 +433,43 @@ impl ScriptRuntime {
 
         {
             let host = host_state.clone();
+            engine.register_fn("set_audio", move |id: i64, asset: &str, volume: f64| {
+                if let Ok(mut state) = host.lock() {
+                    state.with_object_mut(id as u64, |object| {
+                        object.components.audio = Some(AudioEmitter {
+                            asset: asset.to_string(),
+                            volume: volume as f32,
+                            looping: false,
+                            spatial_blend: 0.0,
+                        });
+                    });
+                }
+            });
+        }
+
+        {
+            let host = host_state.clone();
             engine.register_fn("set_collider_radius", move |id: i64, radius: f32| {
                 if let Ok(mut state) = host.lock() {
                     state.with_object_mut(id as u64, |object| {
+                        object.components.collider = Some(Collider2D {
+                            shape: "circle".to_string(),
+                            radius,
+                            width: radius * 2.0,
+                            height: radius * 2.0,
+                            is_sensor: false,
+                        });
+                    });
+                }
+            });
+        }
+
+        {
+            let host = host_state.clone();
+            engine.register_fn("set_collider_radius", move |id: i64, radius: f64| {
+                if let Ok(mut state) = host.lock() {
+                    state.with_object_mut(id as u64, |object| {
+                        let radius = radius as f32;
                         object.components.collider = Some(Collider2D {
                             shape: "circle".to_string(),
                             radius,
@@ -288,6 +514,122 @@ impl ScriptRuntime {
             });
         }
 
+        {
+            let host = host_state.clone();
+            engine.register_fn("find_object", move |name: &str| -> i64 {
+                let Ok(state) = host.lock() else {
+                    return -1;
+                };
+                state
+                    .scene
+                    .as_ref()
+                    .and_then(|scene| find_object_id_by_name(scene, name))
+                    .map(|id| id as i64)
+                    .unwrap_or(-1)
+            });
+        }
+
+        {
+            let host = host_state.clone();
+            engine.register_fn("get_custom", move |id: i64, key: &str| -> String {
+                let Ok(state) = host.lock() else {
+                    return String::new();
+                };
+
+                state
+                    .scene
+                    .as_ref()
+                    .and_then(|scene| {
+                        scene
+                            .objects
+                            .iter()
+                            .find(|object| object.object_id == id as u64)
+                    })
+                    .and_then(|object| object.components.custom_properties.get(key).cloned())
+                    .unwrap_or_default()
+            });
+        }
+
+        {
+            let host = host_state.clone();
+            engine.register_fn("get_custom_f32", move |id: i64, key: &str, fallback: f32| -> f32 {
+                let Ok(state) = host.lock() else {
+                    return fallback;
+                };
+
+                state
+                    .scene
+                    .as_ref()
+                    .and_then(|scene| {
+                        scene
+                            .objects
+                            .iter()
+                            .find(|object| object.object_id == id as u64)
+                    })
+                    .and_then(|object| object.components.custom_properties.get(key))
+                    .and_then(|value| value.trim().parse::<f32>().ok())
+                    .unwrap_or(fallback)
+            });
+        }
+
+        {
+            let host = host_state.clone();
+            engine.register_fn("get_custom_f32", move |id: i64, key: &str, fallback: f64| -> f64 {
+                let Ok(state) = host.lock() else {
+                    return fallback;
+                };
+
+                state
+                    .scene
+                    .as_ref()
+                    .and_then(|scene| {
+                        scene
+                            .objects
+                            .iter()
+                            .find(|object| object.object_id == id as u64)
+                    })
+                    .and_then(|object| object.components.custom_properties.get(key))
+                    .and_then(|value| value.trim().parse::<f64>().ok())
+                    .unwrap_or(fallback)
+            });
+        }
+
+        {
+            let host = host_state.clone();
+            engine.register_fn("key_down", move |key: &str| -> bool {
+                let Ok(state) = host.lock() else {
+                    return false;
+                };
+                state.input.key_down(key)
+            });
+        }
+
+        {
+            let host = host_state.clone();
+            engine.register_fn("move_with_collision", move |id: i64, dx: f32, dy: f32| -> bool {
+                let Ok(mut state) = host.lock() else {
+                    return false;
+                };
+                let Some(scene) = state.scene_mut() else {
+                    return false;
+                };
+                move_object_with_collision(scene, id as u64, dx, dy)
+            });
+        }
+
+        {
+            let host = host_state.clone();
+            engine.register_fn("move_with_collision", move |id: i64, dx: f64, dy: f64| -> bool {
+                let Ok(mut state) = host.lock() else {
+                    return false;
+                };
+                let Some(scene) = state.scene_mut() else {
+                    return false;
+                };
+                move_object_with_collision(scene, id as u64, dx as f32, dy as f32)
+            });
+        }
+
         Self {
             engine,
             ast_cache: HashMap::new(),
@@ -298,6 +640,12 @@ impl ScriptRuntime {
     fn set_scene(&mut self, scene: Option<SceneDocument>) {
         if let Ok(mut state) = self.host_state.lock() {
             state.scene = scene;
+        }
+    }
+
+    fn set_input(&mut self, input: RuntimeInputState) {
+        if let Ok(mut state) = self.host_state.lock() {
+            state.input = input;
         }
     }
 
@@ -320,8 +668,12 @@ impl ScriptRuntime {
                         script_path.display()
                     ))
                 })?;
-                let compiled = self.engine.compile(&source).map_err(|err| {
-                    EngineAppError::Runtime(format!("script compile error: {err}"))
+                let normalized = normalize_legacy_rhai_source(&source);
+                let compiled = self.engine.compile(&normalized).map_err(|err| {
+                    EngineAppError::Runtime(format!(
+                        "script compile error in {}: {err}",
+                        script_path.display()
+                    ))
                 })?;
                 self.ast_cache.insert(script_path.clone(), compiled.clone());
                 compiled
@@ -331,6 +683,12 @@ impl ScriptRuntime {
             scope.push("node_id", job.node_id as i64);
             scope.push("node_name", job.node_name.clone());
             scope.push("frame_phase", job.frame_phase.clone());
+
+            let mut settings = RhaiMap::new();
+            for (key, value) in &job.settings {
+                settings.insert(key.clone().into(), Dynamic::from(value.clone()));
+            }
+            scope.push("settings", settings);
 
             let _ = self
                 .engine
@@ -417,6 +775,7 @@ pub struct EngineApp {
     build_cache: AssetBuildCache,
     scene_path: Option<PathBuf>,
     scene_graph: Option<NodeGraph>,
+    authored_scene: Option<SceneDocument>,
     current_scene: Option<SceneDocument>,
     compiled_graph: Option<CompiledGraphArtifact>,
     last_viewport_readback: Option<ViewportReadback>,
@@ -432,6 +791,9 @@ pub struct EngineApp {
     recovery_attempts: u32,
     telemetry: FallbackTelemetry,
     is_play_mode: bool,
+    input_state: RuntimeInputState,
+    viewport_camera: Camera2d,
+    viewport_readback_balancer: ViewportReadbackBalancer,
     script_runtime: ScriptRuntime,
 
     #[allow(dead_code)]
@@ -494,6 +856,7 @@ impl EngineApp {
             build_cache: AssetBuildCache::new(),
             scene_path: None,
             scene_graph: None,
+            authored_scene: None,
             current_scene: None,
             compiled_graph: None,
             last_viewport_readback: None,
@@ -507,12 +870,18 @@ impl EngineApp {
             recovery_attempts: 0,
             telemetry: FallbackTelemetry::default(),
             is_play_mode: false,
+            input_state: RuntimeInputState::default(),
+            viewport_camera: Camera2d::default(),
+            viewport_readback_balancer: ViewportReadbackBalancer::default(),
             script_runtime,
             audio_runtime,
         })
     }
 
     pub fn start_play_mode(&mut self) {
+        if !self.is_play_mode {
+            self.reset_runtime_scene_from_authored();
+        }
         self.is_play_mode = true;
         self.editor_state.is_playing = true;
     }
@@ -520,18 +889,48 @@ impl EngineApp {
     pub fn stop_play_mode(&mut self) {
         self.is_play_mode = false;
         self.editor_state.is_playing = false;
+        self.reset_runtime_scene_from_authored();
+    }
+
+    pub fn restart_play_mode(&mut self) {
+        self.reset_runtime_scene_from_authored();
+        self.is_play_mode = true;
+        self.editor_state.is_playing = true;
     }
 
     pub fn is_play_mode(&self) -> bool {
         self.is_play_mode
     }
 
+    pub fn set_keyboard_input(&mut self, left: bool, right: bool, up: bool, down: bool) {
+        self.input_state = RuntimeInputState {
+            left,
+            right,
+            up,
+            down,
+        };
+    }
+
+    pub fn set_viewport_camera(&mut self, x: f32, y: f32, zoom: f32) {
+        self.viewport_camera = Camera2d {
+            x,
+            y,
+            zoom: zoom.max(0.05),
+        };
+    }
+
     pub fn step_play_frame(&mut self) -> Result<(), EngineAppError> {
         let was_playing = self.is_play_mode;
+        if !was_playing {
+            self.reset_runtime_scene_from_authored();
+        }
         self.is_play_mode = true;
         let result = self.run_for_frames(1);
         self.is_play_mode = was_playing;
         self.editor_state.is_playing = self.is_play_mode;
+        if !self.is_play_mode {
+            self.reset_runtime_scene_from_authored();
+        }
         result
     }
 
@@ -541,24 +940,25 @@ impl EngineApp {
     }
 
     pub fn set_active_scene(&mut self, scene: SceneDocument) -> Result<bool, EngineAppError> {
+        self.authored_scene = Some(scene.clone());
         self.current_scene = Some(scene.clone());
         self.scene_graph = Some(scene.graph.clone());
         self.script_runtime.set_scene(Some(scene.clone()));
         self.compile_and_apply_graph(scene.graph)
     }
 
-    pub fn viewport_frame(&self) -> ViewportFrame {
-        let frame_index = self
-            .world
-            .get_resource::<FrameCounter>()
-            .map(|counter| counter.0)
-            .unwrap_or(0);
+    fn reset_runtime_scene_from_authored(&mut self) {
+        if let Some(scene) = self.authored_scene.clone() {
+            self.current_scene = Some(scene.clone());
+            self.scene_graph = Some(scene.graph.clone());
+            self.script_runtime.set_scene(Some(scene));
+        }
+    }
 
-        let (width, height) = self
-            .last_viewport_readback
-            .as_ref()
-            .map(|readback| (readback.width, readback.height))
-            .unwrap_or((self.config.window.width, self.config.window.height));
+    pub fn viewport_frame(&self) -> ViewportFrame {
+        let frame_index = self.runtime_tick();
+
+        let (width, height) = self.viewport_dimensions();
 
         ViewportFrame {
             frame_index,
@@ -569,12 +969,38 @@ impl EngineApp {
                 .last_viewport_readback
                 .as_ref()
                 .map(|readback| readback.rgba8.clone()),
-            source: if self.last_viewport_readback.is_some() {
-                "backend_readback".to_string()
-            } else {
-                "none".to_string()
-            },
+            source: self.viewport_source().to_string(),
         }
+    }
+
+    pub fn runtime_tick(&self) -> u64 {
+        self.world
+            .get_resource::<FrameCounter>()
+            .map(|counter| counter.0)
+            .unwrap_or(0)
+    }
+
+    pub fn viewport_dimensions(&self) -> (u32, u32) {
+        self.last_viewport_readback
+            .as_ref()
+            .map(|readback| (readback.width, readback.height))
+            .unwrap_or((self.config.window.width, self.config.window.height))
+    }
+
+    pub fn viewport_source(&self) -> &'static str {
+        if self.last_viewport_readback.is_some() {
+            "backend_readback"
+        } else {
+            "none"
+        }
+    }
+
+    pub fn viewport_readback(&self) -> Option<&ViewportReadback> {
+        self.last_viewport_readback.as_ref()
+    }
+
+    pub fn viewport_readback_interval_frames(&self) -> u32 {
+        self.viewport_readback_balancer.interval_frames()
     }
 
     pub fn diagnostics_snapshot(&self) -> RuntimeDiagnosticsSnapshot {
@@ -711,6 +1137,8 @@ impl EngineApp {
         self.run_render_phase()?;
 
         self.frame_timings.cpu_frame_ms = frame_start.elapsed().as_secs_f32() * 1000.0;
+        self.viewport_readback_balancer
+            .update_from_frame_time(self.frame_timings.cpu_frame_ms, self.target_frame_ms());
         self.backend_diagnostics = self.backend.diagnostics();
         self.frame_timings.gpu_frame_ms = self.backend_diagnostics.last_gpu_frame_ms;
 
@@ -730,7 +1158,8 @@ impl EngineApp {
     }
 
     fn run_input_phase(&mut self) {
-        // Placeholder for input collection; deterministic ordering starts here.
+        // Input is collected in the editor host and synchronized into script runtime state here.
+        self.script_runtime.set_input(self.input_state);
     }
 
     fn run_fixed_update_phase(&mut self, delta_seconds: f32) {
@@ -776,10 +1205,14 @@ impl EngineApp {
     }
 
     fn run_render_phase(&mut self) -> Result<(), EngineAppError> {
+        let capture_viewport_readback = self.viewport_readback_balancer.should_capture();
         let frame = self.backend.acquire_frame(self.surface)?;
 
         if let Some(artifact) = &self.compiled_graph {
-            let submission_graph = optimize_submission_graph(&artifact.render_graph);
+            let mut submission_graph = artifact.render_graph.clone();
+            self.inject_scene_sprites_into_render_graph(&mut submission_graph);
+            self.apply_viewport_camera_to_render_graph(&mut submission_graph);
+            let submission_graph = optimize_submission_graph(&submission_graph);
             self.backend.record_render_graph(frame, &submission_graph)?;
 
             if let Some(mut runtime_state) = self.world.get_resource_mut::<GraphRuntimeState>() {
@@ -792,20 +1225,64 @@ impl EngineApp {
 
         self.backend.submit(frame)?;
         self.backend.present(frame)?;
-        match self.backend.readback_viewport() {
-            Ok(readback) => {
-                self.last_viewport_readback = readback;
-            }
-            Err(err) => {
-                self.push_backend_event(
-                    BackendDiagnosticLevel::Warning,
-                    Some(frame.0),
-                    None,
-                    format!("viewport readback failed: {err}"),
-                );
+        if capture_viewport_readback {
+            match self.backend.readback_viewport() {
+                Ok(readback) => {
+                    self.last_viewport_readback = readback;
+                }
+                Err(err) => {
+                    self.push_backend_event(
+                        BackendDiagnosticLevel::Warning,
+                        Some(frame.0),
+                        None,
+                        format!("viewport readback failed: {err}"),
+                    );
+                }
             }
         }
         Ok(())
+    }
+
+    fn target_frame_ms(&self) -> f32 {
+        if self.config.frame_pacing.target_fps > 0 {
+            1000.0 / self.config.frame_pacing.target_fps as f32
+        } else {
+            self.config.perf_gate.max_frame_ms.max(1.0)
+        }
+    }
+
+    fn inject_scene_sprites_into_render_graph(&self, graph: &mut RenderGraph) {
+        let Some(scene) = self.current_scene.as_ref() else {
+            return;
+        };
+
+        let scene_sprites = sprites_from_scene(scene);
+        if scene_sprites.is_empty() {
+            return;
+        }
+
+        for pass in &mut graph.passes {
+            if let RenderGraphPass::Render(render_pass) = pass {
+                if let Some(batch) = render_pass.batches.first_mut() {
+                    batch.sprites = scene_sprites.clone();
+                } else {
+                    render_pass.batches.push(SpriteBatchCommand {
+                        label: "scene::sprites".to_string(),
+                        blend: BlendMode::Alpha,
+                        target: render_pass.target,
+                        sprites: scene_sprites.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    fn apply_viewport_camera_to_render_graph(&self, graph: &mut RenderGraph) {
+        for pass in &mut graph.passes {
+            if let RenderGraphPass::Render(render_pass) = pass {
+                render_pass.camera = self.viewport_camera;
+            }
+        }
     }
 
     fn apply_frame_pacing(&self, frame_start: Instant) {
@@ -1135,6 +1612,10 @@ impl EngineApp {
         &self.backend_diagnostics
     }
 
+    pub fn cpu_frame_ms(&self) -> f32 {
+        self.frame_timings.cpu_frame_ms
+    }
+
     pub fn backend_capabilities(&self) -> BackendCapabilities {
         self.backend.capabilities()
     }
@@ -1158,6 +1639,96 @@ fn create_backend(kind: BackendKind) -> Box<dyn GraphicsBackend> {
         BackendKind::Dx12 => Box::new(Dx12Backend::new()),
         BackendKind::Dx11 => Box::new(Dx11Backend::new()),
     }
+}
+
+fn sprites_from_scene(scene: &SceneDocument) -> Vec<SpriteInstance> {
+    let layer_meta = scene
+        .layers
+        .iter()
+        .map(|layer| (layer.layer_id, (layer.order, layer.visible)))
+        .collect::<HashMap<_, _>>();
+
+    let mut ordered = Vec::new();
+
+    for object in &scene.objects {
+        let (layer_order, layer_visible) = layer_meta
+            .get(&object.layer_id)
+            .copied()
+            .unwrap_or((0, true));
+        if !layer_visible {
+            continue;
+        }
+
+        let Some(sprite) = object.components.sprite.as_ref() else {
+            continue;
+        };
+
+        let transform = &object.components.transform;
+        let tint = if sprite.tint_rgba == [255, 255, 255, 255] {
+            fallback_tint_from_asset(&sprite.texture_asset)
+        } else {
+            tint_from_rgba(sprite.tint_rgba)
+        };
+        ordered.push((
+            layer_order,
+            sprite.layer_order,
+            object.object_id,
+            SpriteInstance {
+                texture: texture_handle_from_asset(&sprite.texture_asset),
+                x: transform.x,
+                y: transform.y,
+                width: (sprite.width as f32 * transform.scale_x.abs()).max(1.0),
+                height: (sprite.height as f32 * transform.scale_y.abs()).max(1.0),
+                rotation_radians: transform.rotation_radians,
+                tint,
+            },
+        ));
+    }
+
+    ordered.sort_by_key(|(layer_order, sprite_order, object_id, _)| {
+        (*layer_order, *sprite_order, *object_id)
+    });
+
+    ordered.into_iter().map(|(_, _, _, sprite)| sprite).collect()
+}
+
+fn tint_from_rgba(rgba: [u8; 4]) -> [f32; 4] {
+    [
+        rgba[0] as f32 / 255.0,
+        rgba[1] as f32 / 255.0,
+        rgba[2] as f32 / 255.0,
+        rgba[3] as f32 / 255.0,
+    ]
+}
+
+fn fallback_tint_from_asset(asset: &str) -> [f32; 4] {
+    let lower = asset.to_ascii_lowercase();
+    if lower.contains("square") {
+        [0.92, 0.34, 0.32, 1.0]
+    } else if lower.contains("circle") {
+        [0.32, 0.74, 0.95, 1.0]
+    } else if lower.contains("triangle") {
+        [0.96, 0.82, 0.28, 1.0]
+    } else {
+        [0.86, 0.86, 0.86, 1.0]
+    }
+}
+
+fn texture_handle_from_asset(asset: &str) -> TextureHandle {
+    let lower = asset.to_ascii_lowercase();
+    if lower.contains("square") {
+        return TextureHandle(0);
+    }
+    if lower.contains("circle") {
+        return TextureHandle(1);
+    }
+    if lower.contains("triangle") {
+        return TextureHandle(2);
+    }
+
+    let mut hasher = DefaultHasher::new();
+    lower.hash(&mut hasher);
+    TextureHandle((hasher.finish() % 32) + 3)
 }
 
 fn optimize_submission_graph(graph: &RenderGraph) -> RenderGraph {

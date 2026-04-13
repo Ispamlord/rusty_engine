@@ -8,6 +8,10 @@
 
 ## Current implementation status
 
+Detailed status tracker:
+
+- [docs/code_status.md](docs/code_status.md)
+
 ### Implemented now (M1-M4 scoped runtime implementation)
 - Backend lifecycle contract in `engine_render_api`:
   - `initialize`, `create_surface`, `resize`, `acquire_frame`, `record_render_graph`, `submit`, `present`, `destroy`

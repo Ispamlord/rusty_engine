@@ -1,5 +1,17 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+pub mod config;
+pub mod custom_registry;
+
+pub use config::{
+    load_node_config, parse_node_config, save_node_config, NodeConfigDocument, NodeConfigError,
+    NodeInputConfig, NodeOutputConfig, NodeTypeDescriptor, PredefinedNodeType,
+};
+pub use custom_registry::{
+    load_custom_node_registry, parse_custom_node_registry, save_custom_node_registry,
+    CustomNodeRegistration, CustomNodeRegistry, CustomNodeRegistryError,
+};
+
 use engine_render_api::{
     BackendCapabilities, BackendKind, BlendMode, Camera2d, GraphResourceDescriptor,
     GraphResourceKind, GraphResourceLifetime, RenderGraph, RenderGraphPass, RenderPassNode,
@@ -163,6 +175,34 @@ impl Default for BuildExportPayload {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum NodeLibraryScope {
+    #[default]
+    ProjectLocal,
+    GlobalShared,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CustomNodePayload {
+    pub type_name: String,
+    pub config_path: String,
+    #[serde(default)]
+    pub impl_path: Option<String>,
+    #[serde(default)]
+    pub library_scope: NodeLibraryScope,
+}
+
+impl Default for CustomNodePayload {
+    fn default() -> Self {
+        Self {
+            type_name: "CustomNode".to_string(),
+            config_path: "assets/nodes/custom.node.yml".to_string(),
+            impl_path: Some("assets/nodes/custom.rhai".to_string()),
+            library_scope: NodeLibraryScope::ProjectLocal,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum NodePayload {
     GameplayEvent(GameplayEventPayload),
@@ -174,6 +214,7 @@ pub enum NodePayload {
     ComputePass(ComputePassPayload),
     AssetReference(AssetReferencePayload),
     BuildExport(BuildExportPayload),
+    Custom(CustomNodePayload),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -194,6 +235,7 @@ pub enum NodeKind {
     ComputePass,
     AssetReference,
     BuildExport,
+    Custom,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -341,6 +383,8 @@ pub struct ScriptJobDescriptor {
     pub script_asset: String,
     pub entry: String,
     pub frame_phase: String,
+    #[serde(default)]
+    pub settings: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -564,6 +608,19 @@ pub fn compile_graph(
                 script_asset: payload.script_asset,
                 entry: payload.entry,
                 frame_phase: payload.frame_phase,
+                settings: node.settings.clone(),
+            });
+        }
+
+        if node.kind == NodeKind::Custom {
+            let payload = custom_script_payload(node);
+            script_jobs.push(ScriptJobDescriptor {
+                node_id: node.id,
+                node_name: node.name.clone(),
+                script_asset: payload.script_asset,
+                entry: payload.entry,
+                frame_phase: payload.frame_phase,
+                settings: node.settings.clone(),
             });
         }
 
@@ -769,15 +826,17 @@ fn resolve_execution_target(
         return Ok(ResolvedExecutionTarget::Cpu);
     }
 
-    if node.kind == NodeKind::ScriptBehavior {
+    if matches!(node.kind, NodeKind::ScriptBehavior | NodeKind::Custom) {
         match node.target {
             NodeExecutionTarget::Cpu => return Ok(ResolvedExecutionTarget::Cpu),
             NodeExecutionTarget::Hybrid => {
                 diagnostics.push(CompileDiagnostic {
                     severity: DiagnosticSeverity::Info,
                     node_id: Some(node.id),
-                    message: "ScriptBehavior executes on CPU even when Hybrid is selected"
-                        .to_string(),
+                    message: format!(
+                        "{:?} executes on CPU even when Hybrid is selected",
+                        node.kind
+                    ),
                 });
                 return Ok(ResolvedExecutionTarget::Cpu);
             }
@@ -870,7 +929,8 @@ fn phase_for_node_kind(kind: NodeKind) -> &'static str {
         NodeKind::GameplayFlow
         | NodeKind::GameplayEvent
         | NodeKind::ScriptBehavior
-        | NodeKind::ObjectInitializer => "gameplay",
+        | NodeKind::ObjectInitializer
+        | NodeKind::Custom => "gameplay",
         NodeKind::MathState => "math",
         NodeKind::RenderPass | NodeKind::ComputePass => "render",
         NodeKind::AssetReference => "asset",
@@ -919,6 +979,9 @@ fn payload_hint(node: &Node) -> String {
         Some(NodePayload::BuildExport(payload)) => {
             format!("export:{}", payload.target)
         }
+        Some(NodePayload::Custom(payload)) => {
+            format!("custom:{}:{}", payload.type_name, payload.config_path)
+        }
         None => "legacy_settings".to_string(),
     }
 }
@@ -939,6 +1002,34 @@ fn script_payload(node: &Node) -> ScriptBehaviorPayload {
     if let Some(entry) = node.settings.get("script_entry") {
         payload.entry = entry.clone();
     }
+    if let Some(frame_phase) = node.settings.get("script_phase") {
+        payload.frame_phase = frame_phase.clone();
+    }
+
+    payload
+}
+
+fn custom_script_payload(node: &Node) -> ScriptBehaviorPayload {
+    let mut payload = ScriptBehaviorPayload::default();
+
+    if let Some(NodePayload::Custom(custom_payload)) = node.payload.as_ref() {
+        if let Some(script_asset) = custom_payload.impl_path.as_ref() {
+            payload.script_asset = script_asset.clone();
+        }
+    }
+
+    if let Some(script_asset) = node.settings.get("impl_path") {
+        payload.script_asset = script_asset.clone();
+    } else if let Some(script_asset) = node.settings.get("script_asset") {
+        payload.script_asset = script_asset.clone();
+    }
+
+    if let Some(entry) = node.settings.get("script_entry") {
+        payload.entry = entry.clone();
+    } else {
+        payload.entry = "execute".to_string();
+    }
+
     if let Some(frame_phase) = node.settings.get("script_phase") {
         payload.frame_phase = frame_phase.clone();
     }
@@ -1064,7 +1155,12 @@ fn make_placeholder_sprites(count: u32) -> Vec<SpriteInstance> {
             width: 32.0,
             height: 32.0,
             rotation_radians: 0.0,
-            tint: [1.0, 1.0, 1.0, 1.0],
+            tint: match index % 4 {
+                0 => [0.95, 0.42, 0.40, 1.0],
+                1 => [0.42, 0.75, 0.96, 1.0],
+                2 => [0.48, 0.88, 0.58, 1.0],
+                _ => [0.96, 0.82, 0.38, 1.0],
+            },
         })
         .collect()
 }

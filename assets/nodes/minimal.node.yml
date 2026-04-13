@@ -1,0 +1,16 @@
+version: 1
+type_name: MinimalNode
+display_name: Minimal Node
+description: Basic custom node template for user-authored logic.
+category: Gameplay
+inputs:
+  - name: input
+    type: { Predefined: Data }
+    required: false
+    description: Optional input payload.
+outputs:
+  - name: output
+    type: { Predefined: Data }
+    description: Forward or transformed payload.
+default_impl_path: assets/nodes/minimal.rhai
+tags: [custom, template, minimal]

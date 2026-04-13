@@ -9,5 +9,6 @@ bevy_ecs.workspace = true
 engine_render_api = { path = "../engine_render_api" }
 ron.workspace = true
 serde.workspace = true
+serde_yaml.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

@@ -45,6 +45,7 @@ pub struct VulkanBackend {
     submit_fence: Option<vk::Fence>,
     surface_state: Option<VulkanSurfaceState>,
     surface_window_handles: Option<SurfaceWindowHandles>,
+    last_recorded_graph: Option<RenderGraph>,
     last_viewport_readback: Option<ViewportReadback>,
 }
 
@@ -76,6 +77,7 @@ impl VulkanBackend {
             submit_fence: None,
             surface_state: None,
             surface_window_handles: None,
+            last_recorded_graph: None,
             last_viewport_readback: None,
         }
     }
@@ -184,6 +186,7 @@ impl VulkanBackend {
         self.submit_fence = None;
         self.physical_device = None;
         self.surface_window_handles = None;
+        self.last_recorded_graph = None;
         self.last_viewport_readback = None;
 
         Ok(())
@@ -501,12 +504,15 @@ impl VulkanBackend {
 
         for pass in &graph.passes {
             if let RenderGraphPass::Render(render) = pass {
+                let zoom = render.camera.zoom.max(0.05);
                 for batch in &render.batches {
                     for sprite in &batch.sprites {
-                        let cx = (width as f32 * 0.5 + sprite.x).round() as i32;
-                        let cy = (height as f32 * 0.5 + sprite.y).round() as i32;
-                        let hw = (sprite.width * 0.5).round().max(1.0) as i32;
-                        let hh = (sprite.height * 0.5).round().max(1.0) as i32;
+                        let cx = (width as f32 * 0.5 + (sprite.x + render.camera.x) * zoom)
+                            .round() as i32;
+                        let cy = (height as f32 * 0.5 + (sprite.y + render.camera.y) * zoom)
+                            .round() as i32;
+                        let hw = (sprite.width * 0.5 * zoom).round().max(1.0) as i32;
+                        let hh = (sprite.height * 0.5 * zoom).round().max(1.0) as i32;
                         let color = [
                             (sprite.tint[0].clamp(0.0, 1.0) * 255.0) as u8,
                             (sprite.tint[1].clamp(0.0, 1.0) * 255.0) as u8,
@@ -516,8 +522,24 @@ impl VulkanBackend {
                         let max_x = (cx + hw).min(width as i32 - 1);
                         let min_y = (cy - hh).max(0);
                         let max_y = (cy + hh).min(height as i32 - 1);
+                        let shape = sprite.texture.0 % 3;
+                        let hwf = hw.max(1) as f32;
+                        let hhf = hh.max(1) as f32;
                         for py in min_y..=max_y {
                             for px in min_x..=max_x {
+                                let nx = (px - cx) as f32 / hwf;
+                                let ny = (py - cy) as f32 / hhf;
+                                let inside = match shape {
+                                    1 => nx * nx + ny * ny <= 1.0,
+                                    2 => {
+                                        let t = ((ny + 1.0) * 0.5).clamp(0.0, 1.0);
+                                        nx.abs() <= t
+                                    }
+                                    _ => true,
+                                };
+                                if !inside {
+                                    continue;
+                                }
                                 let idx = ((py as u32 * width + px as u32) * 4) as usize;
                                 rgba[idx] = color[0];
                                 rgba[idx + 1] = color[1];
@@ -692,6 +714,8 @@ impl GraphicsBackend for VulkanBackend {
         let handle = SurfaceHandle(self.allocate_handle());
         self.active_surface = Some(handle);
         self.surface_config = Some(config);
+        self.last_recorded_graph = None;
+        self.last_viewport_readback = None;
 
         if config.headless {
             self.surface_window_handles = None;
@@ -971,7 +995,8 @@ impl GraphicsBackend for VulkanBackend {
             });
         }
 
-        self.last_viewport_readback = self.synthesize_viewport(graph);
+        self.last_recorded_graph = Some(graph.clone());
+        self.last_viewport_readback = None;
 
         Ok(())
     }
@@ -1084,6 +1109,11 @@ impl GraphicsBackend for VulkanBackend {
     }
 
     fn readback_viewport(&mut self) -> Result<Option<ViewportReadback>, BackendError> {
+        if self.last_viewport_readback.is_none() {
+            if let Some(graph) = self.last_recorded_graph.as_ref() {
+                self.last_viewport_readback = self.synthesize_viewport(graph);
+            }
+        }
         Ok(self.last_viewport_readback.clone())
     }
 

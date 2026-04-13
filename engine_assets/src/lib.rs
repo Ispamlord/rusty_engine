@@ -15,6 +15,7 @@ pub enum AssetKind {
     Audio,
     Shape,
     Graph,
+    NodeConfig,
     Shader,
     Unknown,
 }
@@ -628,6 +629,16 @@ pub fn parse_shader_metadata(source: &str) -> Result<ShaderMetadata, AssetError>
 }
 
 pub fn infer_asset_kind(path: &Path) -> AssetKind {
+    let file_name_lower = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    if file_name_lower.ends_with(".node.yml") || file_name_lower.ends_with(".node.yaml") {
+        return AssetKind::NodeConfig;
+    }
+
     if path
         .components()
         .any(|component| component.as_os_str() == "basic_shapes")
@@ -889,6 +900,14 @@ mod tests {
         );
         assert_eq!(infer_asset_kind(Path::new("scene.ron")), AssetKind::Graph);
         assert_eq!(infer_asset_kind(Path::new("scene.scene")), AssetKind::Graph);
+        assert_eq!(
+            infer_asset_kind(Path::new("assets/nodes/decision.node.yml")),
+            AssetKind::NodeConfig
+        );
+        assert_eq!(
+            infer_asset_kind(Path::new("assets/nodes/decision.node.yaml")),
+            AssetKind::NodeConfig
+        );
         assert_eq!(infer_asset_kind(Path::new("sound.ogg")), AssetKind::Audio);
         assert_eq!(infer_asset_kind(Path::new("post.comp")), AssetKind::Shader);
         assert_eq!(infer_asset_kind(Path::new("logic.rhai")), AssetKind::Shader);
