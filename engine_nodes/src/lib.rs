@@ -384,6 +384,8 @@ pub struct ScriptJobDescriptor {
     pub entry: String,
     pub frame_phase: String,
     #[serde(default)]
+    pub dependencies: Vec<NodeId>,
+    #[serde(default)]
     pub settings: BTreeMap<String, String>,
 }
 
@@ -608,6 +610,7 @@ pub fn compile_graph(
                 script_asset: payload.script_asset,
                 entry: payload.entry,
                 frame_phase: payload.frame_phase,
+                dependencies: node.dependencies.clone(),
                 settings: node.settings.clone(),
             });
         }
@@ -620,6 +623,7 @@ pub fn compile_graph(
                 script_asset: payload.script_asset,
                 entry: payload.entry,
                 frame_phase: payload.frame_phase,
+                dependencies: node.dependencies.clone(),
                 settings: node.settings.clone(),
             });
         }

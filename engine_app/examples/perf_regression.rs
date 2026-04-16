@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::Path;
+use std::time::Instant;
 
 use engine_app::EngineApp;
 use engine_core::EngineConfig;
@@ -38,25 +39,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         app.run_for_frames(1)?;
     }
 
-    let mut samples = Vec::with_capacity(sample_frames as usize);
+    let mut app_wall_samples = Vec::with_capacity(sample_frames as usize);
+    let mut runtime_cpu_samples = Vec::with_capacity(sample_frames as usize);
+    let mut backend_cpu_samples = Vec::with_capacity(sample_frames as usize);
+
     for _ in 0..sample_frames {
+        let frame_start = Instant::now();
         app.run_for_frames(1)?;
-        samples.push(app.backend_diagnostics().last_cpu_frame_ms as f64);
+        app_wall_samples.push(frame_start.elapsed().as_secs_f64() * 1000.0);
+        runtime_cpu_samples.push(app.cpu_frame_ms() as f64);
+        backend_cpu_samples.push(app.backend_diagnostics().last_cpu_frame_ms as f64);
     }
 
-    samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let sum: f64 = samples.iter().sum();
-    let avg = if samples.is_empty() {
-        0.0
-    } else {
-        sum / samples.len() as f64
-    };
-
-    let p95_index = ((samples.len() as f64) * 0.95).floor() as usize;
-    let p95 = samples
-        .get(p95_index.min(samples.len().saturating_sub(1)))
-        .copied()
-        .unwrap_or(0.0);
+    let (avg, p95) = summarize_stats(&mut app_wall_samples);
+    let (runtime_avg, runtime_p95) = summarize_stats(&mut runtime_cpu_samples);
+    let (backend_avg, backend_p95) = summarize_stats(&mut backend_cpu_samples);
 
     let metrics = format!(
         "backend={:?}\nwarmup_frames={}\nsample_frames={}\navg_frame_ms={:.4}\np95_frame_ms={:.4}\n",
@@ -65,6 +62,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         sample_frames,
         avg,
         p95,
+    );
+
+    let metrics = format!(
+        "{metrics}avg_runtime_cpu_ms={runtime_avg:.4}\np95_runtime_cpu_ms={runtime_p95:.4}\navg_backend_cpu_ms={backend_avg:.4}\np95_backend_cpu_ms={backend_p95:.4}\n"
     );
 
     let metrics_out = std::env::var("PERF_METRICS_OUT")
@@ -106,10 +107,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!(
-        "perf_regression: backend={:?}, avg_ms={:.4}, p95_ms={:.4}, out={}",
+        "perf_regression: backend={:?}, app_avg_ms={:.4}, app_p95_ms={:.4}, runtime_cpu_avg_ms={:.4}, runtime_cpu_p95_ms={:.4}, backend_cpu_avg_ms={:.4}, backend_cpu_p95_ms={:.4}, out={}",
         app.active_backend(),
         avg,
         p95,
+        runtime_avg,
+        runtime_p95,
+        backend_avg,
+        backend_p95,
         metrics_out
     );
 
@@ -125,4 +130,22 @@ fn parse_value(content: &str, key: &str) -> Option<f64> {
             None
         }
     })
+}
+
+fn summarize_stats(samples: &mut [f64]) -> (f64, f64) {
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    let avg = if samples.is_empty() {
+        0.0
+    } else {
+        samples.iter().sum::<f64>() / samples.len() as f64
+    };
+
+    let p95_index = ((samples.len() as f64) * 0.95).floor() as usize;
+    let p95 = samples
+        .get(p95_index.min(samples.len().saturating_sub(1)))
+        .copied()
+        .unwrap_or(0.0);
+
+    (avg, p95)
 }

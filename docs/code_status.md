@@ -1,6 +1,6 @@
 # Code Status
 
-Last updated: 2026-04-14
+Last updated: 2026-04-16
 
 This document summarizes what is currently implemented in code, what is usable with caveats, and what is still scaffold/in progress.
 
@@ -49,13 +49,13 @@ Status legend:
 
 - DONE: Perf smoke and perf regression examples, plus CI integration hooks.
 - DONE: Runtime frame pacing controls and fixed-step spiral-of-death protection.
-- PARTIAL: Current perf regression metric samples backend CPU frame timings; it does not represent complete app-frame cost in all scenarios.
-- PARTIAL: No explicit core-topology aware scheduler tuning yet (high-clock vs many-core balancing is not fully modeled).
-- PARTIAL: Script jobs are currently executed sequentially in runtime gameplay phase.
+- DONE: Perf regression harness now measures full app-frame wall timing and records runtime/backend CPU timing breakdowns.
+- DONE: Core-topology aware scheduler tuning now models high-clock vs many-core balancing through configurable scheduler bias and worker limits.
+- DONE: Runtime script jobs execute in dependency waves with conflict-safe parallel dispatch for independent jobs.
 
 ## Recommended Next Milestones
 
 - TODO: Implement full GPU draw/dispatch translation path with production shader/material binding.
-- TODO: Add conflict-safe parallel script job execution for independent jobs.
-- TODO: Expand perf regression harness to include full runtime frame timing (not backend-only timing).
+- TODO: Add richer script conflict analysis (read/write sets) so more jobs can be auto-promoted to safe parallel execution without manual hints.
+- TODO: Extend perf regression thresholds to gate app/runtime/backend timing channels independently per backend profile.
 - TODO: Add backend-specific GPU instrumentation and frame capture hooks for deeper profiling.

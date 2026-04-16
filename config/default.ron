@@ -38,4 +38,12 @@
         recover_device_loss: true,
         max_recovery_attempts: 3,
     ),
+    scheduler_tuning: (
+        enabled: true,
+        topology_bias: Balanced,
+        reserve_main_thread: true,
+        min_workers: 1,
+        max_workers: 16,
+        script_parallel_min_jobs: 2,
+    ),
 )

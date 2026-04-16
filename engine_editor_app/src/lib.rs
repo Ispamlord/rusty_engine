@@ -1268,6 +1268,16 @@ impl EditorUi {
     fn draw_top_menu(&mut self, ctx: &egui::Context) {
         let cpu_frame_ms = self.app.runtime.cpu_frame_ms();
         let fps = fps_from_ms(cpu_frame_ms);
+        let play_mode = self.app.runtime.is_play_mode();
+        let fps_label = if play_mode { "Play FPS" } else { "Preview FPS" };
+        let fps_tooltip = if play_mode {
+            format!("Estimated from runtime CPU frame time: {:.2} ms", cpu_frame_ms)
+        } else {
+            format!(
+                "Estimated from preview runtime CPU frame time: {:.2} ms. The editor still runs runtime frames for viewport/diagnostics even when play mode is off.",
+                cpu_frame_ms
+            )
+        };
 
         egui::TopBottomPanel::top("editor_top_menu").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -1433,8 +1443,8 @@ impl EditorUi {
                     }
                 }
                 ui.separator();
-                ui.label(format!("FPS: {:.1}", fps))
-                    .on_hover_text(format!("Estimated from CPU frame time: {:.2} ms", cpu_frame_ms));
+                ui.label(format!("{fps_label}: {:.1}", fps))
+                    .on_hover_text(fps_tooltip);
                 ui.separator();
                 ui.label(format!("Status: {}", self.app.status_line));
             });
@@ -3026,8 +3036,19 @@ impl EditorUi {
                     snapshot.frame_timings.node_compile_ms
                 ));
                 ui.label(format!(
-                    "FPS: {:.1}",
+                    "{}: {:.1}",
+                    if self.app.runtime.is_play_mode() {
+                        "Play FPS"
+                    } else {
+                        "Preview FPS"
+                    },
                     fps_from_ms(snapshot.frame_timings.cpu_frame_ms)
+                ));
+                ui.label(format!(
+                    "Script scheduler: workers={}, min_parallel_jobs={}, bias={:?}",
+                    snapshot.script_scheduler_workers,
+                    snapshot.script_scheduler_min_parallel_jobs,
+                    snapshot.script_scheduler_topology_bias,
                 ));
                 ui.label(format!(
                     "Fallback events: {}, Shader rebuild errors: {}",
@@ -3686,7 +3707,9 @@ fn recommended_setting_keys(kind: NodeKind) -> &'static str {
         NodeKind::GameplayEvent => "event_name",
         NodeKind::GameplayFlow => "condition_key, expected_value",
         NodeKind::MathState => "operation, lhs, rhs, output_key",
-        NodeKind::ScriptBehavior => "script_asset, script_entry, script_phase",
+        NodeKind::ScriptBehavior => {
+            "script_asset, script_entry, script_phase, parallel_safe, script_parallel_key"
+        }
         NodeKind::ObjectInitializer => "object_name, layer_id, x, y",
         NodeKind::RenderPass => {
             "target_resource, target_width, target_height, sprite_count, blend"
@@ -3696,7 +3719,7 @@ fn recommended_setting_keys(kind: NodeKind) -> &'static str {
         }
         NodeKind::AssetReference => "asset_path, asset_kind",
         NodeKind::BuildExport => "target",
-        NodeKind::Custom => "config_path, impl_path",
+        NodeKind::Custom => "config_path, impl_path, parallel_safe, script_parallel_key",
     }
 }
 

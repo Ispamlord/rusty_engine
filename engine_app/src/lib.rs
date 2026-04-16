@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -17,7 +17,10 @@ use engine_assets::{
     ScriptBinding, ShaderCompileOptions, ShaderSourceKind, ShaderTarget, Sprite2D, Transform2D,
 };
 use engine_audio::{audio_sync_system, AudioRuntime, AudioState};
-use engine_core::{load_config_from_ron, BackendPreference, EngineConfig, EngineCoreError};
+use engine_core::{
+    load_config_from_ron, BackendPreference, EngineConfig, EngineCoreError,
+    SchedulerTopologyBias, SchedulerTuningConfig,
+};
 use engine_editor::{draw_overlay, EditorState, FrameTimings};
 use engine_nodes::{
     compile_graph, CompileDiagnostic, CompiledGraphArtifact, DiagnosticAnchor, EcsJobDescriptor,
@@ -33,6 +36,7 @@ use engine_render_api::{
     RenderGraphPass, SpriteBatchCommand, SpriteInstance, SurfaceConfig, SurfaceHandle,
     SurfaceWindowHandles, TextureHandle, ViewportReadback,
 };
+use rayon::prelude::*;
 use rhai::{Dynamic, Engine as RhaiEngine, Scope, AST};
 use rhai::Map as RhaiMap;
 use thiserror::Error;
@@ -58,6 +62,9 @@ pub struct RuntimeDiagnosticsSnapshot {
     pub frame_timings: FrameTimings,
     pub telemetry: FallbackTelemetry,
     pub active_backend: BackendKind,
+    pub script_scheduler_workers: usize,
+    pub script_scheduler_min_parallel_jobs: usize,
+    pub script_scheduler_topology_bias: SchedulerTopologyBias,
 }
 
 #[derive(Resource, Default)]
@@ -143,10 +150,59 @@ struct ScriptHostState {
     input: RuntimeInputState,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ScriptSchedulerConfig {
+    workers: usize,
+    min_parallel_jobs: usize,
+    topology_bias: SchedulerTopologyBias,
+}
+
+impl ScriptSchedulerConfig {
+    fn from_engine_config(config: SchedulerTuningConfig) -> Self {
+        let available = thread::available_parallelism()
+            .map(|value| value.get())
+            .unwrap_or(1)
+            .max(1);
+
+        if !config.enabled {
+            return Self {
+                workers: 1,
+                min_parallel_jobs: usize::MAX,
+                topology_bias: config.topology_bias,
+            };
+        }
+
+        let usable = if config.reserve_main_thread {
+            available.saturating_sub(1).max(1)
+        } else {
+            available
+        };
+
+        let biased = match config.topology_bias {
+            SchedulerTopologyBias::Balanced => usable,
+            SchedulerTopologyBias::PreferHighClock => ((usable + 1) / 2).max(1),
+            SchedulerTopologyBias::PreferManyCore => usable,
+        };
+
+        let min_workers = config.min_workers.max(1) as usize;
+        let max_workers = config.max_workers.max(config.min_workers).max(1) as usize;
+        let workers = biased.clamp(min_workers, max_workers);
+
+        Self {
+            workers,
+            min_parallel_jobs: config.script_parallel_min_jobs.max(2) as usize,
+            topology_bias: config.topology_bias,
+        }
+    }
+}
+
 struct ScriptRuntime {
     engine: RhaiEngine,
     ast_cache: HashMap<PathBuf, AST>,
+    source_cache: HashMap<PathBuf, String>,
     host_state: Arc<Mutex<ScriptHostState>>,
+    scheduler: ScriptSchedulerConfig,
+    parallel_pool: Option<rayon::ThreadPool>,
 }
 
 impl ScriptHostState {
@@ -273,8 +329,379 @@ fn normalize_legacy_rhai_source(source: &str) -> String {
     source.replace("let mut ", "let ")
 }
 
+fn parse_bool_setting(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ScriptJobAccessKey {
+    Global,
+    Key(String),
+}
+
+#[derive(Debug, Clone)]
+struct ParallelScriptInvocation {
+    job: ScriptJobDescriptor,
+    normalized_source: String,
+}
+
+fn create_rhai_engine(host_state: Arc<Mutex<ScriptHostState>>) -> RhaiEngine {
+    let mut engine = RhaiEngine::new();
+
+    {
+        let host = host_state.clone();
+        engine.on_print(move |message| {
+            if let Ok(mut state) = host.lock() {
+                state.logs.push(message.to_string());
+            }
+        });
+    }
+
+    {
+        let host = host_state.clone();
+        engine.register_fn("spawn_object", move |name: &str| -> i64 {
+            let Ok(mut state) = host.lock() else {
+                return -1;
+            };
+            let next_id = if state.next_object_id == 0 {
+                1000
+            } else {
+                state.next_object_id
+            };
+            state.next_object_id = next_id.saturating_add(1);
+            let object = SceneObject {
+                object_id: next_id,
+                parent: None,
+                layer_id: 1,
+                name: name.to_string(),
+                tags: Vec::new(),
+                components: SceneComponents::default(),
+            };
+            if let Some(scene) = state.scene_mut() {
+                scene.objects.push(object);
+            }
+            next_id as i64
+        });
+    }
+
+    {
+        let host = host_state.clone();
+        engine.register_fn("despawn_object", move |id: i64| {
+            if let Ok(mut state) = host.lock() {
+                if let Some(scene) = state.scene_mut() {
+                    scene.objects.retain(|object| object.object_id != id as u64);
+                }
+            }
+        });
+    }
+
+    {
+        let host = host_state.clone();
+        engine.register_fn(
+            "set_transform",
+            move |id: i64, x: f32, y: f32, rot: f32, sx: f32, sy: f32| {
+                if let Ok(mut state) = host.lock() {
+                    state.with_object_mut(id as u64, |object| {
+                        object.components.transform = Transform2D {
+                            x,
+                            y,
+                            rotation_radians: rot,
+                            scale_x: sx,
+                            scale_y: sy,
+                        };
+                    });
+                }
+            },
+        );
+    }
+
+    {
+        let host = host_state.clone();
+        engine.register_fn(
+            "set_transform",
+            move |id: i64, x: f64, y: f64, rot: f64, sx: f64, sy: f64| {
+                if let Ok(mut state) = host.lock() {
+                    state.with_object_mut(id as u64, |object| {
+                        object.components.transform = Transform2D {
+                            x: x as f32,
+                            y: y as f32,
+                            rotation_radians: rot as f32,
+                            scale_x: sx as f32,
+                            scale_y: sy as f32,
+                        };
+                    });
+                }
+            },
+        );
+    }
+
+    {
+        let host = host_state.clone();
+        engine.register_fn(
+            "set_sprite",
+            move |id: i64, texture: &str, width: i64, height: i64| {
+                if let Ok(mut state) = host.lock() {
+                    state.with_object_mut(id as u64, |object| {
+                        object.components.sprite = Some(Sprite2D {
+                            texture_asset: texture.to_string(),
+                            width: width.max(1) as u32,
+                            height: height.max(1) as u32,
+                            tint_rgba: [255, 255, 255, 255],
+                            layer_order: 0,
+                        });
+                    });
+                }
+            },
+        );
+    }
+
+    {
+        let host = host_state.clone();
+        engine.register_fn("set_custom", move |id: i64, key: &str, value: &str| {
+            if let Ok(mut state) = host.lock() {
+                state.with_object_mut(id as u64, |object| {
+                    object
+                        .components
+                        .custom_properties
+                        .insert(key.to_string(), value.to_string());
+                });
+            }
+        });
+    }
+
+    {
+        let host = host_state.clone();
+        engine.register_fn("emit_event", move |name: &str, payload: &str| {
+            if let Ok(mut state) = host.lock() {
+                state.events.push(format!("{name}:{payload}"));
+            }
+        });
+    }
+
+    {
+        let host = host_state.clone();
+        engine.register_fn("set_audio", move |id: i64, asset: &str, volume: f32| {
+            if let Ok(mut state) = host.lock() {
+                state.with_object_mut(id as u64, |object| {
+                    object.components.audio = Some(AudioEmitter {
+                        asset: asset.to_string(),
+                        volume,
+                        looping: false,
+                        spatial_blend: 0.0,
+                    });
+                });
+            }
+        });
+    }
+
+    {
+        let host = host_state.clone();
+        engine.register_fn("set_audio", move |id: i64, asset: &str, volume: f64| {
+            if let Ok(mut state) = host.lock() {
+                state.with_object_mut(id as u64, |object| {
+                    object.components.audio = Some(AudioEmitter {
+                        asset: asset.to_string(),
+                        volume: volume as f32,
+                        looping: false,
+                        spatial_blend: 0.0,
+                    });
+                });
+            }
+        });
+    }
+
+    {
+        let host = host_state.clone();
+        engine.register_fn("set_collider_radius", move |id: i64, radius: f32| {
+            if let Ok(mut state) = host.lock() {
+                state.with_object_mut(id as u64, |object| {
+                    object.components.collider = Some(Collider2D {
+                        shape: "circle".to_string(),
+                        radius,
+                        width: radius * 2.0,
+                        height: radius * 2.0,
+                        is_sensor: false,
+                    });
+                });
+            }
+        });
+    }
+
+    {
+        let host = host_state.clone();
+        engine.register_fn("set_collider_radius", move |id: i64, radius: f64| {
+            if let Ok(mut state) = host.lock() {
+                state.with_object_mut(id as u64, |object| {
+                    let radius = radius as f32;
+                    object.components.collider = Some(Collider2D {
+                        shape: "circle".to_string(),
+                        radius,
+                        width: radius * 2.0,
+                        height: radius * 2.0,
+                        is_sensor: false,
+                    });
+                });
+            }
+        });
+    }
+
+    {
+        let host = host_state.clone();
+        engine.register_fn(
+            "set_script",
+            move |id: i64, script_asset: &str, entry: &str, frame_phase: &str| {
+                if let Ok(mut state) = host.lock() {
+                    state.with_object_mut(id as u64, |object| {
+                        object.components.script = Some(ScriptBinding {
+                            script_asset: script_asset.to_string(),
+                            entry: entry.to_string(),
+                            frame_phase: frame_phase.to_string(),
+                        });
+                    });
+                }
+            },
+        );
+    }
+
+    {
+        let host = host_state.clone();
+        engine.register_fn("object_count", move || -> i64 {
+            let Ok(state) = host.lock() else {
+                return 0;
+            };
+            state
+                .scene
+                .as_ref()
+                .map(|scene| scene.objects.len() as i64)
+                .unwrap_or(0)
+        });
+    }
+
+    {
+        let host = host_state.clone();
+        engine.register_fn("find_object", move |name: &str| -> i64 {
+            let Ok(state) = host.lock() else {
+                return -1;
+            };
+            state
+                .scene
+                .as_ref()
+                .and_then(|scene| find_object_id_by_name(scene, name))
+                .map(|id| id as i64)
+                .unwrap_or(-1)
+        });
+    }
+
+    {
+        let host = host_state.clone();
+        engine.register_fn("get_custom", move |id: i64, key: &str| -> String {
+            let Ok(state) = host.lock() else {
+                return String::new();
+            };
+
+            state
+                .scene
+                .as_ref()
+                .and_then(|scene| {
+                    scene
+                        .objects
+                        .iter()
+                        .find(|object| object.object_id == id as u64)
+                })
+                .and_then(|object| object.components.custom_properties.get(key).cloned())
+                .unwrap_or_default()
+        });
+    }
+
+    {
+        let host = host_state.clone();
+        engine.register_fn("get_custom_f32", move |id: i64, key: &str, fallback: f32| -> f32 {
+            let Ok(state) = host.lock() else {
+                return fallback;
+            };
+
+            state
+                .scene
+                .as_ref()
+                .and_then(|scene| {
+                    scene
+                        .objects
+                        .iter()
+                        .find(|object| object.object_id == id as u64)
+                })
+                .and_then(|object| object.components.custom_properties.get(key))
+                .and_then(|value| value.trim().parse::<f32>().ok())
+                .unwrap_or(fallback)
+        });
+    }
+
+    {
+        let host = host_state.clone();
+        engine.register_fn("get_custom_f32", move |id: i64, key: &str, fallback: f64| -> f64 {
+            let Ok(state) = host.lock() else {
+                return fallback;
+            };
+
+            state
+                .scene
+                .as_ref()
+                .and_then(|scene| {
+                    scene
+                        .objects
+                        .iter()
+                        .find(|object| object.object_id == id as u64)
+                })
+                .and_then(|object| object.components.custom_properties.get(key))
+                .and_then(|value| value.trim().parse::<f64>().ok())
+                .unwrap_or(fallback)
+        });
+    }
+
+    {
+        let host = host_state.clone();
+        engine.register_fn("key_down", move |key: &str| -> bool {
+            let Ok(state) = host.lock() else {
+                return false;
+            };
+            state.input.key_down(key)
+        });
+    }
+
+    {
+        let host = host_state.clone();
+        engine.register_fn("move_with_collision", move |id: i64, dx: f32, dy: f32| -> bool {
+            let Ok(mut state) = host.lock() else {
+                return false;
+            };
+            let Some(scene) = state.scene_mut() else {
+                return false;
+            };
+            move_object_with_collision(scene, id as u64, dx, dy)
+        });
+    }
+
+    {
+        let host = host_state.clone();
+        engine.register_fn("move_with_collision", move |id: i64, dx: f64, dy: f64| -> bool {
+            let Ok(mut state) = host.lock() else {
+                return false;
+            };
+            let Some(scene) = state.scene_mut() else {
+                return false;
+            };
+            move_object_with_collision(scene, id as u64, dx as f32, dy as f32)
+        });
+    }
+
+    engine
+}
+
 impl ScriptRuntime {
-    fn new() -> Self {
+    fn new(config: SchedulerTuningConfig) -> Self {
         let host_state = Arc::new(Mutex::new(ScriptHostState {
             scene: None,
             events: Vec::new(),
@@ -283,357 +710,25 @@ impl ScriptRuntime {
             input: RuntimeInputState::default(),
         }));
 
-        let mut engine = RhaiEngine::new();
-
-        {
-            let host = host_state.clone();
-            engine.on_print(move |message| {
-                if let Ok(mut state) = host.lock() {
-                    state.logs.push(message.to_string());
-                }
-            });
-        }
-
-        {
-            let host = host_state.clone();
-            engine.register_fn("spawn_object", move |name: &str| -> i64 {
-                let Ok(mut state) = host.lock() else {
-                    return -1;
-                };
-                let next_id = if state.next_object_id == 0 {
-                    1000
-                } else {
-                    state.next_object_id
-                };
-                state.next_object_id = next_id.saturating_add(1);
-                let object = SceneObject {
-                    object_id: next_id,
-                    parent: None,
-                    layer_id: 1,
-                    name: name.to_string(),
-                    tags: Vec::new(),
-                    components: SceneComponents::default(),
-                };
-                if let Some(scene) = state.scene_mut() {
-                    scene.objects.push(object);
-                }
-                next_id as i64
-            });
-        }
-
-        {
-            let host = host_state.clone();
-            engine.register_fn("despawn_object", move |id: i64| {
-                if let Ok(mut state) = host.lock() {
-                    if let Some(scene) = state.scene_mut() {
-                        scene.objects.retain(|object| object.object_id != id as u64);
-                    }
-                }
-            });
-        }
-
-        {
-            let host = host_state.clone();
-            engine.register_fn(
-                "set_transform",
-                move |id: i64, x: f32, y: f32, rot: f32, sx: f32, sy: f32| {
-                    if let Ok(mut state) = host.lock() {
-                        state.with_object_mut(id as u64, |object| {
-                            object.components.transform = Transform2D {
-                                x,
-                                y,
-                                rotation_radians: rot,
-                                scale_x: sx,
-                                scale_y: sy,
-                            };
-                        });
-                    }
-                },
-            );
-        }
-
-        {
-            let host = host_state.clone();
-            engine.register_fn(
-                "set_transform",
-                move |id: i64, x: f64, y: f64, rot: f64, sx: f64, sy: f64| {
-                    if let Ok(mut state) = host.lock() {
-                        state.with_object_mut(id as u64, |object| {
-                            object.components.transform = Transform2D {
-                                x: x as f32,
-                                y: y as f32,
-                                rotation_radians: rot as f32,
-                                scale_x: sx as f32,
-                                scale_y: sy as f32,
-                            };
-                        });
-                    }
-                },
-            );
-        }
-
-        {
-            let host = host_state.clone();
-            engine.register_fn(
-                "set_sprite",
-                move |id: i64, texture: &str, width: i64, height: i64| {
-                    if let Ok(mut state) = host.lock() {
-                        state.with_object_mut(id as u64, |object| {
-                            object.components.sprite = Some(Sprite2D {
-                                texture_asset: texture.to_string(),
-                                width: width.max(1) as u32,
-                                height: height.max(1) as u32,
-                                tint_rgba: [255, 255, 255, 255],
-                                layer_order: 0,
-                            });
-                        });
-                    }
-                },
-            );
-        }
-
-        {
-            let host = host_state.clone();
-            engine.register_fn("set_custom", move |id: i64, key: &str, value: &str| {
-                if let Ok(mut state) = host.lock() {
-                    state.with_object_mut(id as u64, |object| {
-                        object
-                            .components
-                            .custom_properties
-                            .insert(key.to_string(), value.to_string());
-                    });
-                }
-            });
-        }
-
-        {
-            let host = host_state.clone();
-            engine.register_fn("emit_event", move |name: &str, payload: &str| {
-                if let Ok(mut state) = host.lock() {
-                    state.events.push(format!("{name}:{payload}"));
-                }
-            });
-        }
-
-        {
-            let host = host_state.clone();
-            engine.register_fn("set_audio", move |id: i64, asset: &str, volume: f32| {
-                if let Ok(mut state) = host.lock() {
-                    state.with_object_mut(id as u64, |object| {
-                        object.components.audio = Some(AudioEmitter {
-                            asset: asset.to_string(),
-                            volume,
-                            looping: false,
-                            spatial_blend: 0.0,
-                        });
-                    });
-                }
-            });
-        }
-
-        {
-            let host = host_state.clone();
-            engine.register_fn("set_audio", move |id: i64, asset: &str, volume: f64| {
-                if let Ok(mut state) = host.lock() {
-                    state.with_object_mut(id as u64, |object| {
-                        object.components.audio = Some(AudioEmitter {
-                            asset: asset.to_string(),
-                            volume: volume as f32,
-                            looping: false,
-                            spatial_blend: 0.0,
-                        });
-                    });
-                }
-            });
-        }
-
-        {
-            let host = host_state.clone();
-            engine.register_fn("set_collider_radius", move |id: i64, radius: f32| {
-                if let Ok(mut state) = host.lock() {
-                    state.with_object_mut(id as u64, |object| {
-                        object.components.collider = Some(Collider2D {
-                            shape: "circle".to_string(),
-                            radius,
-                            width: radius * 2.0,
-                            height: radius * 2.0,
-                            is_sensor: false,
-                        });
-                    });
-                }
-            });
-        }
-
-        {
-            let host = host_state.clone();
-            engine.register_fn("set_collider_radius", move |id: i64, radius: f64| {
-                if let Ok(mut state) = host.lock() {
-                    state.with_object_mut(id as u64, |object| {
-                        let radius = radius as f32;
-                        object.components.collider = Some(Collider2D {
-                            shape: "circle".to_string(),
-                            radius,
-                            width: radius * 2.0,
-                            height: radius * 2.0,
-                            is_sensor: false,
-                        });
-                    });
-                }
-            });
-        }
-
-        {
-            let host = host_state.clone();
-            engine.register_fn(
-                "set_script",
-                move |id: i64, script_asset: &str, entry: &str, frame_phase: &str| {
-                    if let Ok(mut state) = host.lock() {
-                        state.with_object_mut(id as u64, |object| {
-                            object.components.script = Some(ScriptBinding {
-                                script_asset: script_asset.to_string(),
-                                entry: entry.to_string(),
-                                frame_phase: frame_phase.to_string(),
-                            });
-                        });
-                    }
-                },
-            );
-        }
-
-        {
-            let host = host_state.clone();
-            engine.register_fn("object_count", move || -> i64 {
-                let Ok(state) = host.lock() else {
-                    return 0;
-                };
-                state
-                    .scene
-                    .as_ref()
-                    .map(|scene| scene.objects.len() as i64)
-                    .unwrap_or(0)
-            });
-        }
-
-        {
-            let host = host_state.clone();
-            engine.register_fn("find_object", move |name: &str| -> i64 {
-                let Ok(state) = host.lock() else {
-                    return -1;
-                };
-                state
-                    .scene
-                    .as_ref()
-                    .and_then(|scene| find_object_id_by_name(scene, name))
-                    .map(|id| id as i64)
-                    .unwrap_or(-1)
-            });
-        }
-
-        {
-            let host = host_state.clone();
-            engine.register_fn("get_custom", move |id: i64, key: &str| -> String {
-                let Ok(state) = host.lock() else {
-                    return String::new();
-                };
-
-                state
-                    .scene
-                    .as_ref()
-                    .and_then(|scene| {
-                        scene
-                            .objects
-                            .iter()
-                            .find(|object| object.object_id == id as u64)
-                    })
-                    .and_then(|object| object.components.custom_properties.get(key).cloned())
-                    .unwrap_or_default()
-            });
-        }
-
-        {
-            let host = host_state.clone();
-            engine.register_fn("get_custom_f32", move |id: i64, key: &str, fallback: f32| -> f32 {
-                let Ok(state) = host.lock() else {
-                    return fallback;
-                };
-
-                state
-                    .scene
-                    .as_ref()
-                    .and_then(|scene| {
-                        scene
-                            .objects
-                            .iter()
-                            .find(|object| object.object_id == id as u64)
-                    })
-                    .and_then(|object| object.components.custom_properties.get(key))
-                    .and_then(|value| value.trim().parse::<f32>().ok())
-                    .unwrap_or(fallback)
-            });
-        }
-
-        {
-            let host = host_state.clone();
-            engine.register_fn("get_custom_f32", move |id: i64, key: &str, fallback: f64| -> f64 {
-                let Ok(state) = host.lock() else {
-                    return fallback;
-                };
-
-                state
-                    .scene
-                    .as_ref()
-                    .and_then(|scene| {
-                        scene
-                            .objects
-                            .iter()
-                            .find(|object| object.object_id == id as u64)
-                    })
-                    .and_then(|object| object.components.custom_properties.get(key))
-                    .and_then(|value| value.trim().parse::<f64>().ok())
-                    .unwrap_or(fallback)
-            });
-        }
-
-        {
-            let host = host_state.clone();
-            engine.register_fn("key_down", move |key: &str| -> bool {
-                let Ok(state) = host.lock() else {
-                    return false;
-                };
-                state.input.key_down(key)
-            });
-        }
-
-        {
-            let host = host_state.clone();
-            engine.register_fn("move_with_collision", move |id: i64, dx: f32, dy: f32| -> bool {
-                let Ok(mut state) = host.lock() else {
-                    return false;
-                };
-                let Some(scene) = state.scene_mut() else {
-                    return false;
-                };
-                move_object_with_collision(scene, id as u64, dx, dy)
-            });
-        }
-
-        {
-            let host = host_state.clone();
-            engine.register_fn("move_with_collision", move |id: i64, dx: f64, dy: f64| -> bool {
-                let Ok(mut state) = host.lock() else {
-                    return false;
-                };
-                let Some(scene) = state.scene_mut() else {
-                    return false;
-                };
-                move_object_with_collision(scene, id as u64, dx as f32, dy as f32)
-            });
-        }
+        let engine = create_rhai_engine(host_state.clone());
+        let scheduler = ScriptSchedulerConfig::from_engine_config(config);
+        let parallel_pool = if scheduler.workers > 1 {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(scheduler.workers)
+                .thread_name(|index| format!("script-worker-{index}"))
+                .build()
+                .ok()
+        } else {
+            None
+        };
 
         Self {
             engine,
             ast_cache: HashMap::new(),
+            source_cache: HashMap::new(),
             host_state,
+            scheduler,
+            parallel_pool,
         }
     }
 
@@ -656,50 +751,293 @@ impl ScriptRuntime {
             .and_then(|state| state.scene.clone())
     }
 
+    fn scheduler_workers(&self) -> usize {
+        self.scheduler.workers
+    }
+
+    fn scheduler_min_parallel_jobs(&self) -> usize {
+        self.scheduler.min_parallel_jobs
+    }
+
+    fn scheduler_topology_bias(&self) -> SchedulerTopologyBias {
+        self.scheduler.topology_bias
+    }
+
     fn execute_jobs(&mut self, jobs: &[ScriptJobDescriptor]) -> Result<(), EngineAppError> {
-        for job in jobs {
-            let script_path = PathBuf::from(&job.script_asset);
-            let ast = if let Some(cached) = self.ast_cache.get(&script_path) {
-                cached.clone()
-            } else {
-                let source = fs::read_to_string(&script_path).map_err(|err| {
-                    EngineAppError::Runtime(format!(
-                        "failed to read script {}: {err}",
-                        script_path.display()
-                    ))
-                })?;
-                let normalized = normalize_legacy_rhai_source(&source);
-                let compiled = self.engine.compile(&normalized).map_err(|err| {
-                    EngineAppError::Runtime(format!(
-                        "script compile error in {}: {err}",
-                        script_path.display()
-                    ))
-                })?;
-                self.ast_cache.insert(script_path.clone(), compiled.clone());
-                compiled
-            };
-
-            let mut scope = Scope::new();
-            scope.push("node_id", job.node_id as i64);
-            scope.push("node_name", job.node_name.clone());
-            scope.push("frame_phase", job.frame_phase.clone());
-
-            let mut settings = RhaiMap::new();
-            for (key, value) in &job.settings {
-                settings.insert(key.clone().into(), Dynamic::from(value.clone()));
-            }
-            scope.push("settings", settings);
-
-            let _ = self
-                .engine
-                .call_fn::<Dynamic>(&mut scope, &ast, &job.entry, ())
-                .map_err(|err| EngineAppError::Runtime(format!("script runtime error: {err}")))?;
+        if jobs.is_empty() {
+            return Ok(());
         }
+
+        for wave in Self::build_script_waves(jobs) {
+            let wave_jobs = wave
+                .iter()
+                .filter_map(|index| jobs.get(*index))
+                .collect::<Vec<_>>();
+
+            if self.can_parallelize_wave(&wave_jobs) {
+                self.execute_wave_parallel(&wave_jobs)?;
+            } else {
+                for job in wave_jobs {
+                    self.execute_single_job(job)?;
+                }
+            }
+        }
+
         Ok(())
+    }
+
+    fn execute_single_job(&mut self, job: &ScriptJobDescriptor) -> Result<(), EngineAppError> {
+        let script_path = PathBuf::from(&job.script_asset);
+        let ast = self.compile_cached_ast(&script_path)?;
+        Self::execute_job_with_ast(&self.engine, &ast, job)
+    }
+
+    fn execute_wave_parallel(
+        &mut self,
+        wave_jobs: &[&ScriptJobDescriptor],
+    ) -> Result<(), EngineAppError> {
+        let mut invocations = Vec::with_capacity(wave_jobs.len());
+        for job in wave_jobs {
+            let script_path = PathBuf::from(&job.script_asset);
+            let source = self.normalized_script_source(&script_path)?.to_string();
+            invocations.push(ParallelScriptInvocation {
+                job: (*job).clone(),
+                normalized_source: source,
+            });
+        }
+
+        let host_state = self.host_state.clone();
+
+        let run_wave = || {
+            invocations
+                .par_iter()
+                .map(|invocation| {
+                    let engine = create_rhai_engine(host_state.clone());
+                    let ast = engine
+                        .compile(&invocation.normalized_source)
+                        .map_err(|err| {
+                            EngineAppError::Runtime(format!(
+                                "script compile error in {}: {err}",
+                                invocation.job.script_asset
+                            ))
+                        })?;
+                    Self::execute_job_with_ast(&engine, &ast, &invocation.job)
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let results = if let Some(pool) = &self.parallel_pool {
+            pool.install(run_wave)
+        } else {
+            run_wave()
+        };
+
+        for result in results {
+            result?;
+        }
+
+        Ok(())
+    }
+
+    fn compile_cached_ast(&mut self, script_path: &Path) -> Result<AST, EngineAppError> {
+        if let Some(cached) = self.ast_cache.get(script_path) {
+            return Ok(cached.clone());
+        }
+
+        let source = self.normalized_script_source(script_path)?.to_string();
+        let compiled = self.engine.compile(&source).map_err(|err| {
+            EngineAppError::Runtime(format!(
+                "script compile error in {}: {err}",
+                script_path.display()
+            ))
+        })?;
+        self.ast_cache
+            .insert(script_path.to_path_buf(), compiled.clone());
+        Ok(compiled)
+    }
+
+    fn normalized_script_source(&mut self, script_path: &Path) -> Result<&str, EngineAppError> {
+        if !self.source_cache.contains_key(script_path) {
+            let source = fs::read_to_string(script_path).map_err(|err| {
+                EngineAppError::Runtime(format!(
+                    "failed to read script {}: {err}",
+                    script_path.display()
+                ))
+            })?;
+            let normalized = normalize_legacy_rhai_source(&source);
+            self.source_cache
+                .insert(script_path.to_path_buf(), normalized);
+        }
+
+        Ok(self
+            .source_cache
+            .get(script_path)
+            .map(String::as_str)
+            .unwrap_or_default())
+    }
+
+    fn execute_job_with_ast(
+        engine: &RhaiEngine,
+        ast: &AST,
+        job: &ScriptJobDescriptor,
+    ) -> Result<(), EngineAppError> {
+        let mut scope = Scope::new();
+        scope.push("node_id", job.node_id as i64);
+        scope.push("node_name", job.node_name.clone());
+        scope.push("frame_phase", job.frame_phase.clone());
+
+        let mut settings = RhaiMap::new();
+        for (key, value) in &job.settings {
+            settings.insert(key.clone().into(), Dynamic::from(value.clone()));
+        }
+        scope.push("settings", settings);
+
+        let _ = engine
+            .call_fn::<Dynamic>(&mut scope, ast, &job.entry, ())
+            .map_err(|err| EngineAppError::Runtime(format!("script runtime error: {err}")))?;
+
+        Ok(())
+    }
+
+    fn can_parallelize_wave(&self, wave_jobs: &[&ScriptJobDescriptor]) -> bool {
+        if self.parallel_pool.is_none() {
+            return false;
+        }
+
+        if wave_jobs.len() < self.scheduler.min_parallel_jobs {
+            return false;
+        }
+
+        let mut seen = HashSet::new();
+        for job in wave_jobs {
+            match Self::job_access_key(job) {
+                ScriptJobAccessKey::Global => return false,
+                ScriptJobAccessKey::Key(key) => {
+                    if !seen.insert(key) {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        true
+    }
+
+    fn job_access_key(job: &ScriptJobDescriptor) -> ScriptJobAccessKey {
+        let explicitly_safe = job
+            .settings
+            .get("parallel_safe")
+            .and_then(|raw| parse_bool_setting(raw))
+            .unwrap_or(false);
+
+        if !explicitly_safe {
+            return ScriptJobAccessKey::Global;
+        }
+
+        if let Some(value) = job
+            .settings
+            .get("script_parallel_key")
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+        {
+            return ScriptJobAccessKey::Key(format!("key:{value}"));
+        }
+
+        if let Some(value) = job
+            .settings
+            .get("object_id")
+            .and_then(|value| value.trim().parse::<u64>().ok())
+        {
+            return ScriptJobAccessKey::Key(format!("object:{value}"));
+        }
+
+        if let Some(value) = job
+            .settings
+            .get("object_name")
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+        {
+            return ScriptJobAccessKey::Key(format!("object_name:{value}"));
+        }
+
+        if let Some(value) = job
+            .settings
+            .get("layer_id")
+            .and_then(|value| value.trim().parse::<u64>().ok())
+        {
+            return ScriptJobAccessKey::Key(format!("layer:{value}"));
+        }
+
+        ScriptJobAccessKey::Global
+    }
+
+    fn build_script_waves(jobs: &[ScriptJobDescriptor]) -> Vec<Vec<usize>> {
+        if jobs.len() <= 1 {
+            return vec![(0..jobs.len()).collect()];
+        }
+
+        let script_index = jobs
+            .iter()
+            .enumerate()
+            .map(|(index, job)| (job.node_id, index))
+            .collect::<HashMap<_, _>>();
+
+        let mut indegree = vec![0usize; jobs.len()];
+        let mut edges = vec![Vec::<usize>::new(); jobs.len()];
+
+        for (index, job) in jobs.iter().enumerate() {
+            for dependency in &job.dependencies {
+                if let Some(&dep_index) = script_index.get(dependency) {
+                    indegree[index] += 1;
+                    edges[dep_index].push(index);
+                }
+            }
+        }
+
+        let mut ready = indegree
+            .iter()
+            .enumerate()
+            .filter_map(|(index, degree)| (*degree == 0).then_some(index))
+            .collect::<VecDeque<_>>();
+
+        let mut waves = Vec::new();
+        let mut processed = 0usize;
+
+        while !ready.is_empty() {
+            let wave_len = ready.len();
+            let mut wave = Vec::with_capacity(wave_len);
+
+            for _ in 0..wave_len {
+                if let Some(index) = ready.pop_front() {
+                    wave.push(index);
+                }
+            }
+
+            wave.sort_unstable();
+
+            for index in &wave {
+                processed += 1;
+                for dependent in &edges[*index] {
+                    indegree[*dependent] = indegree[*dependent].saturating_sub(1);
+                    if indegree[*dependent] == 0 {
+                        ready.push_back(*dependent);
+                    }
+                }
+            }
+
+            waves.push(wave);
+        }
+
+        if processed != jobs.len() {
+            vec![(0..jobs.len()).collect()]
+        } else {
+            waves
+        }
     }
 
     fn invalidate_script(&mut self, script_path: &Path) {
         self.ast_cache.remove(script_path);
+        self.source_cache.remove(script_path);
     }
 }
 
@@ -839,7 +1177,7 @@ impl EngineApp {
         audio_schedule.add_systems(audio_sync_system);
 
         let backend_diagnostics = backend.diagnostics();
-        let script_runtime = ScriptRuntime::new();
+        let script_runtime = ScriptRuntime::new(config.scheduler_tuning);
 
         Ok(Self {
             config,
@@ -1021,6 +1359,9 @@ impl EngineApp {
             frame_timings: self.frame_timings.clone(),
             telemetry: self.telemetry.clone(),
             active_backend: self.active_backend,
+            script_scheduler_workers: self.script_runtime.scheduler_workers(),
+            script_scheduler_min_parallel_jobs: self.script_runtime.scheduler_min_parallel_jobs(),
+            script_scheduler_topology_bias: self.script_runtime.scheduler_topology_bias(),
         }
     }
 

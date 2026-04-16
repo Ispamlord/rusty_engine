@@ -121,6 +121,43 @@ impl Default for RecoveryPolicy {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SchedulerTopologyBias {
+    Balanced,
+    PreferHighClock,
+    PreferManyCore,
+}
+
+impl Default for SchedulerTopologyBias {
+    fn default() -> Self {
+        Self::Balanced
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SchedulerTuningConfig {
+    pub enabled: bool,
+    #[serde(default)]
+    pub topology_bias: SchedulerTopologyBias,
+    pub reserve_main_thread: bool,
+    pub min_workers: u32,
+    pub max_workers: u32,
+    pub script_parallel_min_jobs: u32,
+}
+
+impl Default for SchedulerTuningConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            topology_bias: SchedulerTopologyBias::Balanced,
+            reserve_main_thread: true,
+            min_workers: 1,
+            max_workers: 16,
+            script_parallel_min_jobs: 2,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EngineConfig {
     pub window: WindowConfig,
@@ -138,6 +175,8 @@ pub struct EngineConfig {
     pub shader_toolchain: ShaderToolchainConfig,
     #[serde(default)]
     pub recovery_policy: RecoveryPolicy,
+    #[serde(default)]
+    pub scheduler_tuning: SchedulerTuningConfig,
 }
 
 impl Default for EngineConfig {
@@ -153,6 +192,7 @@ impl Default for EngineConfig {
             perf_gate: PerfGateConfig::default(),
             shader_toolchain: ShaderToolchainConfig::default(),
             recovery_policy: RecoveryPolicy::default(),
+            scheduler_tuning: SchedulerTuningConfig::default(),
         }
     }
 }
@@ -209,5 +249,9 @@ mod tests {
         let parsed: EngineConfig = ron::from_str(legacy).expect("legacy config should parse");
         assert_eq!(parsed.fixed_step, FixedStepConfig::default());
         assert_eq!(parsed.recovery_policy, RecoveryPolicy::default());
+        assert_eq!(
+            parsed.scheduler_tuning,
+            SchedulerTuningConfig::default()
+        );
     }
 }
