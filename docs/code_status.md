@@ -1,6 +1,6 @@
 # Code Status
 
-Last updated: 2026-04-16
+Last updated: 2026-07-10
 
 This document summarizes what is currently implemented in code, what is usable with caveats, and what is still scaffold/in progress.
 
@@ -8,6 +8,22 @@ Status legend:
 - DONE: Implemented and in active use.
 - PARTIAL: Implemented but with known limitations.
 - TODO: Planned or scaffold-level only.
+
+## Quality Gate Status
+
+- `cargo test --workspace` passes.
+- `cargo clippy --workspace --all-targets -- -D warnings` passes.
+- All crates have at least basic unit-test coverage; config, platform, render API, backends, nodes, assets, runtime, physics, audio, and editor crates received a production-hardening pass.
+
+## Recent Production Hardening
+
+- **Config validation**: `engine_core` now validates every config section on load, rejecting values that would cause division-by-zero, impossible worker ranges, empty toolchain paths, or unusable window dimensions.
+- **Platform docs/tests**: `engine_platform` gained rustdoc and additional tests for backend selection edge cases.
+- **Render API / backends**: `engine_render_api` added overflow-safe viewport buffer sizing and diagnostics tests; Vulkan/DX11/DX12 backends use the safe sizing and have basic unit tests. Vulkan `resize` and extent selection guard against zero dimensions; fence waits use a finite timeout instead of `u64::MAX`. GPU instrumentation and frame-capture hooks are now exposed through the `GraphicsBackend` trait (`set_gpu_timestamps_enabled`, `configure_gpu_instrumentation`, `request_frame_capture`, `poll_frame_capture`) and implemented by all three backends via `BackendInstrumentationState`.
+- **Node compiler**: `engine_nodes` now rejects self-dependencies with a dedicated error and no longer panics on an internal node lookup miss.
+- **Asset pipeline**: `engine_assets` fails explicitly on missing includes, unsupported include syntax, and malformed shader metadata; temporary compiler output is cleaned up on both success and failure.
+- **Runtime systems**: `engine_app` drains unbounded script event/log buffers each frame, hardens `spawn_object`/`despawn_object`/`set_sprite` against invalid ids and dimensions, and adds focused unit tests. Frame pacing now spin-yields for the last ~2 ms instead of relying solely on `thread::sleep`, which removes most OS sleep-granularity stutter (especially on Windows). The render-graph submission path no longer clones the whole graph just to sort sprites/batches; it sorts in place. `engine_audio` and `engine_physics` received module docs and unit tests documenting the currently stubbed integrations.
+- **Editor**: `engine_editor` added undoable node renames, dependency-cycle detection in `ConnectNodes` and document validation, a depth guard for recursive asset indexing, and centralized payload syncing from settings. `engine_editor_app` was updated to use the new command signatures.
 
 ## What Is In The Codebase
 
@@ -26,8 +42,7 @@ Status legend:
 - DONE: Viewport camera controls and runtime-to-editor viewport readback.
 - DONE: Adaptive viewport readback cadence balancing (1..4 frames) based on frame-time pressure.
 - DONE: Lazy viewport synthesis in Vulkan/DX11/DX12 compatibility paths (deferred until readback request).
-- PARTIAL: GPU pass metadata/planning is present, but full production-grade material/shader pipeline binding is not finished.
-- PARTIAL: DX11/DX12 compatibility paths are usable but still not final production-depth render backend implementations.
+- **Runtime shader/material binding**: `engine_app::run_render_phase` now preloads every unique `Material::shader_asset` from the active graph through `engine_assets::AssetBuildCache` and forwards the compiled bytecode to the active backend via `GraphicsBackend::preload_shader_bytecode`. Vulkan, DX11, and DX12 cache the bytecode and lazily build user pipelines/descriptors: Vulkan creates material graphics pipelines (built-in VS + user FS) and compute pipelines from SPIR-V; DX11 creates user pixel/compute shaders from DXBC; DX12 creates user graphics/compute PSOs from DXIL. When a user shader is missing or fails to compile, each backend falls back to its built-in sprite/compute path.
 
 ## Editor Feature Status
 
@@ -51,11 +66,14 @@ Status legend:
 - DONE: Runtime frame pacing controls and fixed-step spiral-of-death protection.
 - DONE: Perf regression harness now measures full app-frame wall timing and records runtime/backend CPU timing breakdowns.
 - DONE: Core-topology aware scheduler tuning now models high-clock vs many-core balancing through configurable scheduler bias and worker limits.
-- DONE: Runtime script jobs execute in dependency waves with conflict-safe parallel dispatch for independent jobs.
+- **Runtime script jobs execute in dependency waves with conflict-safe parallel dispatch for independent jobs.** Script jobs can now declare explicit `read_set` / `write_set` settings; the runtime detects WAW, RAW, and WAR conflicts and only parallelizes non-conflicting jobs. Legacy `script_parallel_key` / `object_id` / `object_name` / `layer_id` markers continue to work.
 
 ## Recommended Next Milestones
 
-- TODO: Implement full GPU draw/dispatch translation path with production shader/material binding.
-- TODO: Add richer script conflict analysis (read/write sets) so more jobs can be auto-promoted to safe parallel execution without manual hints.
-- TODO: Extend perf regression thresholds to gate app/runtime/backend timing channels independently per backend profile.
-- TODO: Add backend-specific GPU instrumentation and frame capture hooks for deeper profiling.
+- PARTIAL: Full descriptor/buffer resource binding for user shaders — bytecode is now consumed, but real textures/storage buffers from `RenderGraph` resources and `ShaderBinding` are not yet bound. The next step is to allocate GPU memory for `create_texture`/`create_render_target`/graph storage buffers and bind them through descriptors/root signatures.
+- DONE: Real GPU draw/dispatch recording on Vulkan (sprite draw + compute dispatch) and real sprite rendering on DX11/DX12 (code written, D3D paths not hardware-verified on this Linux host).
+- DONE: Runtime shader/material binding pipeline (`preload_shader_bytecode`) across Vulkan, DX11, and DX12.
+- DONE: DX11/DX12 native swapchain/backbuffer RTV creation and resize recreation on Windows paths.
+- DONE: Richer script conflict analysis via explicit `read_set` / `write_set` settings on `ScriptBehavior`/`Custom` nodes; the runtime detects WAW, RAW, and WAR conflicts before parallel dispatch. Legacy `script_parallel_key` markers continue to work.
+- DONE: Extend perf regression thresholds to gate app/runtime/backend timing channels independently per backend profile (implemented in `engine_app/examples/perf_regression.rs`).
+- DONE: Backend-specific GPU instrumentation and frame capture hooks (`GraphicsBackend` API + backend implementations + diagnostics counters).

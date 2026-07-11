@@ -25,6 +25,7 @@ version = "0.1.0"
 ash = "0.38"
 ash-window = "0.13"
 bevy_ecs = "0.17"
+bytemuck = "1.21"
 eframe = "0.33"
 egui = "0.33"
 egui-snarl = { version = "0.9", features = ["serde"] }
@@ -44,6 +45,7 @@ windows = { version = "0.62", features = [
   "Win32_Foundation",
   "Win32_Security",
   "Win32_Graphics_Direct3D",
+  "Win32_Graphics_Direct3D_Fxc",
   "Win32_Graphics_Direct3D11",
   "Win32_Graphics_Direct3D12",
   "Win32_Graphics_Dxgi",

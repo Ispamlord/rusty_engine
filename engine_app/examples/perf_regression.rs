@@ -4,6 +4,73 @@ use std::time::Instant;
 
 use engine_app::EngineApp;
 use engine_core::EngineConfig;
+use engine_render_api::BackendKind;
+
+#[derive(Debug, Clone, Copy)]
+struct PerfThresholds {
+    max_avg_frame_ms: f64,
+    max_p95_frame_ms: f64,
+    max_avg_runtime_cpu_ms: f64,
+    max_p95_runtime_cpu_ms: f64,
+    max_avg_backend_cpu_ms: f64,
+    max_p95_backend_cpu_ms: f64,
+}
+
+impl PerfThresholds {
+    /// Default thresholds tuned per backend.
+    ///
+    /// DX11 is a compatibility path and is expected to be slightly slower on
+    /// the CPU side because of its older API model. DX12 and Vulkan share the
+    /// same defaults because they are the primary production backends.
+    fn defaults_for(backend: BackendKind) -> Self {
+        match backend {
+            BackendKind::Dx11 => Self {
+                max_avg_frame_ms: 16.67,
+                max_p95_frame_ms: 20.0,
+                max_avg_runtime_cpu_ms: 8.0,
+                max_p95_runtime_cpu_ms: 12.0,
+                max_avg_backend_cpu_ms: 4.0,
+                max_p95_backend_cpu_ms: 6.0,
+            },
+            BackendKind::Dx12 | BackendKind::Vulkan => Self {
+                max_avg_frame_ms: 16.67,
+                max_p95_frame_ms: 20.0,
+                max_avg_runtime_cpu_ms: 6.0,
+                max_p95_runtime_cpu_ms: 10.0,
+                max_avg_backend_cpu_ms: 3.0,
+                max_p95_backend_cpu_ms: 5.0,
+            },
+        }
+    }
+
+    /// Loads thresholds from environment, falling back to per-backend defaults.
+    fn from_env_or_defaults(backend: BackendKind) -> Self {
+        let defaults = Self::defaults_for(backend);
+        Self {
+            max_avg_frame_ms: parse_env_f64("PERF_MAX_AVG_FRAME_MS", defaults.max_avg_frame_ms),
+            max_p95_frame_ms: parse_env_f64(
+                "PERF_MAX_P95_FRAME_MS",
+                defaults.max_p95_frame_ms,
+            ),
+            max_avg_runtime_cpu_ms: parse_env_f64(
+                "PERF_MAX_AVG_RUNTIME_CPU_MS",
+                defaults.max_avg_runtime_cpu_ms,
+            ),
+            max_p95_runtime_cpu_ms: parse_env_f64(
+                "PERF_MAX_P95_RUNTIME_CPU_MS",
+                defaults.max_p95_runtime_cpu_ms,
+            ),
+            max_avg_backend_cpu_ms: parse_env_f64(
+                "PERF_MAX_AVG_BACKEND_CPU_MS",
+                defaults.max_avg_backend_cpu_ms,
+            ),
+            max_p95_backend_cpu_ms: parse_env_f64(
+                "PERF_MAX_P95_BACKEND_CPU_MS",
+                defaults.max_p95_backend_cpu_ms,
+            ),
+        }
+    }
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config_path = std::env::args()
@@ -55,9 +122,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (runtime_avg, runtime_p95) = summarize_stats(&mut runtime_cpu_samples);
     let (backend_avg, backend_p95) = summarize_stats(&mut backend_cpu_samples);
 
+    let backend = app.active_backend();
+    let thresholds = PerfThresholds::from_env_or_defaults(backend);
+
     let metrics = format!(
         "backend={:?}\nwarmup_frames={}\nsample_frames={}\navg_frame_ms={:.4}\np95_frame_ms={:.4}\n",
-        app.active_backend(),
+        backend,
         warmup_frames,
         sample_frames,
         avg,
@@ -75,17 +145,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     fs::write(&metrics_out, metrics)?;
 
-    let max_avg_ms = std::env::var("PERF_MAX_AVG_FRAME_MS")
-        .ok()
-        .and_then(|raw| raw.parse::<f64>().ok())
-        .unwrap_or(16.67);
-    if avg > max_avg_ms {
-        return Err(format!(
-            "perf regression: avg_frame_ms {:.4} exceeds threshold {:.4}",
-            avg, max_avg_ms
-        )
-        .into());
-    }
+    let mut failures = Vec::new();
+    check_threshold(
+        &mut failures,
+        "avg_frame_ms",
+        avg,
+        thresholds.max_avg_frame_ms,
+    );
+    check_threshold(
+        &mut failures,
+        "p95_frame_ms",
+        p95,
+        thresholds.max_p95_frame_ms,
+    );
+    check_threshold(
+        &mut failures,
+        "avg_runtime_cpu_ms",
+        runtime_avg,
+        thresholds.max_avg_runtime_cpu_ms,
+    );
+    check_threshold(
+        &mut failures,
+        "p95_runtime_cpu_ms",
+        runtime_p95,
+        thresholds.max_p95_runtime_cpu_ms,
+    );
+    check_threshold(
+        &mut failures,
+        "avg_backend_cpu_ms",
+        backend_avg,
+        thresholds.max_avg_backend_cpu_ms,
+    );
+    check_threshold(
+        &mut failures,
+        "p95_backend_cpu_ms",
+        backend_p95,
+        thresholds.max_p95_backend_cpu_ms,
+    );
 
     if let Ok(baseline_path) = std::env::var("PERF_BASELINE_PATH") {
         if Path::new(&baseline_path).exists() {
@@ -96,11 +192,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .and_then(|raw| raw.parse::<f64>().ok())
                     .unwrap_or(1.10);
                 if avg > base_avg * allowed_ratio {
-                    return Err(format!(
-                        "perf regression: avg {:.4} exceeds baseline {:.4} * ratio {:.2}",
+                    failures.push(format!(
+                        "avg_frame_ms {:.4} exceeds baseline {:.4} * ratio {:.2}",
                         avg, base_avg, allowed_ratio
-                    )
-                    .into());
+                    ));
                 }
             }
         }
@@ -108,7 +203,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!(
         "perf_regression: backend={:?}, app_avg_ms={:.4}, app_p95_ms={:.4}, runtime_cpu_avg_ms={:.4}, runtime_cpu_p95_ms={:.4}, backend_cpu_avg_ms={:.4}, backend_cpu_p95_ms={:.4}, out={}",
-        app.active_backend(),
+        backend,
         avg,
         p95,
         runtime_avg,
@@ -118,7 +213,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         metrics_out
     );
 
+    if !failures.is_empty() {
+        return Err(format!("perf regression: {}", failures.join("; ")).into());
+    }
+
     Ok(())
+}
+
+fn check_threshold(failures: &mut Vec<String>, name: &str, value: f64, threshold: f64) {
+    if value > threshold {
+        failures.push(format!(
+            "{} {:.4} exceeds threshold {:.4}",
+            name, value, threshold
+        ));
+    }
+}
+
+fn parse_env_f64(var: &str, default: f64) -> f64 {
+    std::env::var(var)
+        .ok()
+        .and_then(|raw| raw.parse::<f64>().ok())
+        .unwrap_or(default)
 }
 
 fn parse_value(content: &str, key: &str) -> Option<f64> {

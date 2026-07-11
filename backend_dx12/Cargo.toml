@@ -9,6 +9,7 @@ engine_core = { path = "../engine_core" }
 engine_render_api = { path = "../engine_render_api" }
 raw-window-handle.workspace = true
 tracing.workspace = true
+bytemuck.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true

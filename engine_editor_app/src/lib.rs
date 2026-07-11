@@ -15,9 +15,8 @@ use engine_editor::{
     EditorCommand, EditorError, EditorProjectState, EditorWorkspaceMode, GraphCanvasState,
 };
 use engine_nodes::{
-    load_node_config, ComputeDispatchConfig, CustomNodePayload, Node, NodeConfigDocument,
-    NodeExecutionTarget, NodeFallbackPolicy, NodeGraph, NodeId, NodeKind, NodeLibraryScope,
-    NodePayload, ScriptBehaviorPayload, CURRENT_GRAPH_VERSION,
+    load_node_config, Node, NodeConfigDocument, NodeExecutionTarget, NodeFallbackPolicy, NodeGraph,
+    NodeId, NodeKind, NodePayload, ScriptBehaviorPayload, CURRENT_GRAPH_VERSION,
 };
 use thiserror::Error;
 
@@ -802,7 +801,10 @@ impl EditorUi {
     ) -> Result<PathBuf, String> {
         let project_root = self.app.project.project_root.clone();
         let source_script_path = resolve_project_asset_path(&project_root, script_asset);
-        let source_script = fs::read_to_string(&source_script_path).unwrap_or_else(|_| {
+        let source_script = if source_script_path.exists() {
+            fs::read_to_string(&source_script_path
+            ).map_err(|err| format!("failed to read source script {}: {err}", source_script_path.display()))?
+        } else {
             let entry = if script_entry.trim().is_empty() {
                 "update"
             } else {
@@ -812,7 +814,7 @@ impl EditorUi {
                 "fn {entry}() {{\n    // Customize gameplay logic here.\n    // Default phase: {}\n}}\n",
                 script_phase.trim()
             )
-        });
+        };
 
         let base = sanitize_file_stem(&node.name);
         let base = if base.is_empty() {
@@ -916,40 +918,22 @@ impl EditorUi {
             return Err(format!("conversion command failed: {err}"));
         }
 
-        let node_mut = self
+        let node_settings = self
             .app
             .project
             .document
             .scene
             .graph
             .nodes
-            .iter_mut()
+            .iter()
             .find(|node| node.id == node_id)
-            .ok_or_else(|| "node no longer exists".to_string())?;
-
-        node_mut.kind = NodeKind::Custom;
-        node_mut.settings.remove("script_asset");
-        node_mut.settings.remove("script_entry");
-        node_mut.settings.remove("script_phase");
-        node_mut
-            .settings
-            .insert("config_path".to_string(), config_rel_str.clone());
-        node_mut
-            .settings
-            .insert("impl_path".to_string(), impl_rel_str.clone());
-        node_mut.payload = Some(NodePayload::Custom(CustomNodePayload {
-            type_name,
-            config_path: config_rel_str.clone(),
-            impl_path: Some(impl_rel_str.clone()),
-            library_scope: NodeLibraryScope::ProjectLocal,
-        }));
-        sync_node_payload_from_settings(node_mut);
+            .map(|node| node.settings.clone())
+            .unwrap_or_default();
 
         self.inspector_node_kind_buffer = Some(NodeKind::Custom);
-        self.inspector_custom_config_path_buffer = config_rel_str;
-        self.inspector_custom_impl_path_buffer = impl_rel_str;
-        self.inspector_settings_buffer = node_mut.settings.clone();
-        self.app.project.dirty = true;
+        self.inspector_custom_config_path_buffer = config_rel_str.clone();
+        self.inspector_custom_impl_path_buffer = impl_rel_str.clone();
+        self.inspector_settings_buffer = node_settings;
 
         if let Err(err) = self.app.project.refresh_asset_index() {
             self.app.status_line = format!("converted node but failed to refresh assets: {err}");
@@ -2140,6 +2124,7 @@ impl EditorUi {
                     if let Err(err) = apply_inspector_node_change(
                         &mut self.app.project,
                         selected,
+                        Some(self.inspector_name_buffer.clone()),
                         Some(kind),
                         Some(target),
                         Some(fallback),
@@ -2156,29 +2141,13 @@ impl EditorUi {
                         None,
                     ) {
                         self.app.status_line = format!("inspector apply failed: {err}");
-                    } else if let Some(node_mut) = self
-                        .app
-                        .project
-                        .document
-                        .scene
-                        .graph
-                        .nodes
-                        .iter_mut()
-                        .find(|node| node.id == selected)
-                    {
-                        node_mut.name = self.inspector_name_buffer.clone();
-                        if let Some(NodePayload::Custom(payload)) = node_mut.payload.as_mut() {
-                            payload.config_path = custom_config_path_buffer.clone();
-                            payload.impl_path = Some(custom_impl_path_buffer.clone());
-                        }
-                        sync_node_payload_from_settings(node_mut);
-                        self.app.project.dirty = true;
                     }
 
                     for (key, value) in script_changes {
                         if let Err(err) = apply_inspector_node_change(
                             &mut self.app.project,
                             selected,
+                            None,
                             None,
                             None,
                             None,
@@ -2199,23 +2168,11 @@ impl EditorUi {
                             None,
                             None,
                             None,
+                            None,
                             Some((key, value)),
                         ) {
                             self.app.status_line = format!("custom metadata update failed: {err}");
                         }
-                    }
-
-                    if let Some(node_mut) = self
-                        .app
-                        .project
-                        .document
-                        .scene
-                        .graph
-                        .nodes
-                        .iter_mut()
-                        .find(|node| node.id == selected)
-                    {
-                        sync_node_payload_from_settings(node_mut);
                     }
 
                     self.last_inspected_node = None;
@@ -2294,6 +2251,7 @@ impl EditorUi {
                                 None,
                                 None,
                                 None,
+                                None,
                                 Some((key.clone(), None)),
                             ) {
                                 had_error = true;
@@ -2313,6 +2271,7 @@ impl EditorUi {
                                 None,
                                 None,
                                 None,
+                                None,
                                 Some((key.clone(), Some(value.clone()))),
                             ) {
                                 had_error = true;
@@ -2322,19 +2281,6 @@ impl EditorUi {
                     }
 
                     if !had_error {
-                        if let Some(node_mut) = self
-                            .app
-                            .project
-                            .document
-                            .scene
-                            .graph
-                            .nodes
-                            .iter_mut()
-                            .find(|node| node.id == selected)
-                        {
-                            sync_node_payload_from_settings(node_mut);
-                            self.app.project.dirty = true;
-                        }
                         self.app.status_line = "node settings applied".to_string();
                         self.last_inspected_node = None;
                         self.canvas_refresh_and_compile();
@@ -3486,222 +3432,6 @@ fn seed_node_settings_from_payload(node: &Node) -> BTreeMap<String, String> {
     settings
 }
 
-fn sync_node_payload_from_settings(node: &mut Node) {
-    match node.kind {
-        NodeKind::GameplayEvent => {
-            let mut payload = node
-                .payload
-                .as_ref()
-                .and_then(|payload| match payload {
-                    NodePayload::GameplayEvent(payload) => Some(payload.clone()),
-                    _ => None,
-                })
-                .unwrap_or_default();
-            if let Some(value) = node.settings.get("event_name") {
-                payload.event_name = value.clone();
-            }
-            node.payload = Some(NodePayload::GameplayEvent(payload));
-        }
-        NodeKind::GameplayFlow => {
-            let mut payload = node
-                .payload
-                .as_ref()
-                .and_then(|payload| match payload {
-                    NodePayload::GameplayFlow(payload) => Some(payload.clone()),
-                    _ => None,
-                })
-                .unwrap_or_default();
-            if let Some(value) = node.settings.get("condition_key") {
-                payload.condition_key = value.clone();
-            }
-            if let Some(value) = node.settings.get("expected_value") {
-                payload.expected_value = value.clone();
-            }
-            node.payload = Some(NodePayload::GameplayFlow(payload));
-        }
-        NodeKind::MathState => {
-            let mut payload = node
-                .payload
-                .as_ref()
-                .and_then(|payload| match payload {
-                    NodePayload::MathState(payload) => Some(payload.clone()),
-                    _ => None,
-                })
-                .unwrap_or_default();
-            if let Some(value) = node.settings.get("operation") {
-                payload.operation = value.clone();
-            }
-            payload.lhs = parse_f32_setting(node.settings.get("lhs"), payload.lhs);
-            payload.rhs = parse_f32_setting(node.settings.get("rhs"), payload.rhs);
-            if let Some(value) = node.settings.get("output_key") {
-                payload.output_key = value.clone();
-            }
-            node.payload = Some(NodePayload::MathState(payload));
-        }
-        NodeKind::ObjectInitializer => {
-            let mut payload = node
-                .payload
-                .as_ref()
-                .and_then(|payload| match payload {
-                    NodePayload::ObjectInitializer(payload) => Some(payload.clone()),
-                    _ => None,
-                })
-                .unwrap_or_default();
-            if let Some(value) = node.settings.get("object_name") {
-                payload.object_name = value.clone();
-            }
-            payload.layer_id = parse_u64_setting(node.settings.get("layer_id"), payload.layer_id);
-            payload.x = parse_f32_setting(node.settings.get("x"), payload.x);
-            payload.y = parse_f32_setting(node.settings.get("y"), payload.y);
-            node.payload = Some(NodePayload::ObjectInitializer(payload));
-        }
-        NodeKind::ScriptBehavior => {
-            let mut payload = node
-                .payload
-                .as_ref()
-                .and_then(|payload| match payload {
-                    NodePayload::ScriptBehavior(payload) => Some(payload.clone()),
-                    _ => None,
-                })
-                .unwrap_or_default();
-            if let Some(value) = node.settings.get("script_asset") {
-                payload.script_asset = value.clone();
-            }
-            if let Some(value) = node.settings.get("script_entry") {
-                payload.entry = value.clone();
-            }
-            if let Some(value) = node.settings.get("script_phase") {
-                payload.frame_phase = value.clone();
-            }
-            node.payload = Some(NodePayload::ScriptBehavior(payload));
-        }
-        NodeKind::RenderPass => {
-            let mut payload = node
-                .payload
-                .as_ref()
-                .and_then(|payload| match payload {
-                    NodePayload::RenderPass(payload) => Some(payload.clone()),
-                    _ => None,
-                })
-                .unwrap_or_default();
-            if let Some(value) = node.settings.get("target_resource") {
-                payload.target_resource = value.clone();
-            }
-            payload.target_width = parse_u32_setting(node.settings.get("target_width"), payload.target_width);
-            payload.target_height = parse_u32_setting(node.settings.get("target_height"), payload.target_height);
-            payload.sprite_count = parse_u32_setting(node.settings.get("sprite_count"), payload.sprite_count);
-            if let Some(value) = node.settings.get("blend") {
-                payload.blend = value.clone();
-            }
-            node.payload = Some(NodePayload::RenderPass(payload));
-        }
-        NodeKind::ComputePass => {
-            let mut payload = node
-                .payload
-                .as_ref()
-                .and_then(|payload| match payload {
-                    NodePayload::ComputePass(payload) => Some(payload.clone()),
-                    _ => None,
-                })
-                .unwrap_or_default();
-            if let Some(value) = node.settings.get("shader") {
-                payload.shader = value.clone();
-            }
-            let dispatch_x = parse_u32_setting(node.settings.get("dispatch_x"), payload.dispatch[0]);
-            let dispatch_y = parse_u32_setting(node.settings.get("dispatch_y"), payload.dispatch[1]);
-            let dispatch_z = parse_u32_setting(node.settings.get("dispatch_z"), payload.dispatch[2]);
-            payload.dispatch = [dispatch_x, dispatch_y, dispatch_z];
-            payload.reads = parse_csv_setting(node.settings.get("read_resources"));
-            payload.writes = parse_csv_setting(node.settings.get("write_resources"));
-            node.compute = Some(ComputeDispatchConfig {
-                x: dispatch_x,
-                y: dispatch_y,
-                z: dispatch_z,
-            });
-            node.payload = Some(NodePayload::ComputePass(payload));
-        }
-        NodeKind::AssetReference => {
-            let mut payload = node
-                .payload
-                .as_ref()
-                .and_then(|payload| match payload {
-                    NodePayload::AssetReference(payload) => Some(payload.clone()),
-                    _ => None,
-                })
-                .unwrap_or_default();
-            if let Some(value) = node.settings.get("asset_path") {
-                payload.asset_path = value.clone();
-            }
-            if let Some(value) = node.settings.get("asset_kind") {
-                payload.asset_kind = value.clone();
-            }
-            node.payload = Some(NodePayload::AssetReference(payload));
-        }
-        NodeKind::BuildExport => {
-            let mut payload = node
-                .payload
-                .as_ref()
-                .and_then(|payload| match payload {
-                    NodePayload::BuildExport(payload) => Some(payload.clone()),
-                    _ => None,
-                })
-                .unwrap_or_default();
-            if let Some(value) = node.settings.get("target") {
-                payload.target = value.clone();
-            }
-            node.payload = Some(NodePayload::BuildExport(payload));
-        }
-        NodeKind::Custom => {
-            let mut payload = node
-                .payload
-                .as_ref()
-                .and_then(|payload| match payload {
-                    NodePayload::Custom(payload) => Some(payload.clone()),
-                    _ => None,
-                })
-                .unwrap_or_default();
-            if let Some(value) = node.settings.get("config_path") {
-                payload.config_path = value.clone();
-            }
-            if let Some(value) = node.settings.get("impl_path") {
-                payload.impl_path = Some(value.clone());
-            }
-            node.payload = Some(NodePayload::Custom(payload));
-        }
-    }
-}
-
-fn parse_u32_setting(value: Option<&String>, fallback: u32) -> u32 {
-    value
-        .and_then(|value| value.trim().parse::<u32>().ok())
-        .unwrap_or(fallback)
-}
-
-fn parse_u64_setting(value: Option<&String>, fallback: u64) -> u64 {
-    value
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .unwrap_or(fallback)
-}
-
-fn parse_f32_setting(value: Option<&String>, fallback: f32) -> f32 {
-    value
-        .and_then(|value| value.trim().parse::<f32>().ok())
-        .unwrap_or(fallback)
-}
-
-fn parse_csv_setting(value: Option<&String>) -> Vec<String> {
-    value
-        .map(|value| {
-            value
-                .split(',')
-                .map(str::trim)
-                .filter(|entry| !entry.is_empty())
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default()
-}
-
 fn recommended_setting_keys(kind: NodeKind) -> &'static str {
     match kind {
         NodeKind::GameplayEvent => "event_name",
@@ -3898,5 +3628,48 @@ impl eframe::App for EditorUi {
         if let Err(err) = self.app.project.autosave_if_dirty() {
             self.app.status_line = format!("autosave failed: {err}");
         }
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn sanitize_file_stem_handles_separators_and_case() {
+        assert_eq!(sanitize_file_stem("My Node Name!"), "my_node_name");
+        assert_eq!(sanitize_file_stem("--__--"), "");
+        assert_eq!(sanitize_file_stem("a_b__c"), "a_b_c");
+    }
+
+    #[test]
+    fn to_pascal_case_converts_snake_case() {
+        assert_eq!(to_pascal_case("my_node_name"), "MyNodeName");
+        assert_eq!(to_pascal_case(""), "");
+        assert_eq!(to_pascal_case("a"), "A");
+    }
+
+    #[test]
+    fn fps_from_ms_handles_edge_cases() {
+        assert!((fps_from_ms(16.6667) - 60.0).abs() < 0.1);
+        assert_eq!(fps_from_ms(0.0), 0.0);
+        assert_eq!(fps_from_ms(f32::NAN), 0.0);
+        assert_eq!(fps_from_ms(f32::INFINITY), 0.0);
+    }
+
+    #[test]
+    fn path_helpers_round_trip_project_paths() {
+        let project = PathBuf::from("/tmp/project");
+        assert_eq!(
+            resolve_project_asset_path(&project, "assets/foo.ron"),
+            PathBuf::from("/tmp/project/assets/foo.ron")
+        );
+        assert_eq!(
+            resolve_project_asset_path(&project, "/abs/path.ron"),
+            PathBuf::from("/abs/path.ron")
+        );
+        assert_eq!(path_to_asset_string(Path::new("a\\b\\c.ron")), "a/b/c.ron");
     }
 }

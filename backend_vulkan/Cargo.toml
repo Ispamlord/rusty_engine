@@ -10,3 +10,5 @@ engine_render_api = { path = "../engine_render_api" }
 ash.workspace = true
 ash-window.workspace = true
 tracing.workspace = true
+naga = { version = "23", features = ["spv-out", "wgsl-in"] }
+bytemuck = "1.21"

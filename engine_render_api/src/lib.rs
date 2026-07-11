@@ -36,6 +36,19 @@ pub struct ViewportReadback {
     pub rgba8: Vec<u8>,
 }
 
+impl ViewportReadback {
+    /// Returns the byte size of a `width x height` RGBA8 viewport buffer, or
+    /// `None` if the dimensions would overflow `usize`.
+    ///
+    /// Backends use this helper to avoid panicking on maliciously large
+    /// viewport configurations during lazy readback synthesis.
+    pub fn buffer_size(width: u32, height: u32) -> Option<usize> {
+        (width as usize)
+            .checked_mul(height as usize)?
+            .checked_mul(4)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TextureDescriptor {
     pub width: u32,
@@ -131,9 +144,24 @@ pub struct SpriteBatchCommand {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShaderBinding {
+    pub set: u32,
+    pub binding: u32,
+    pub resource: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Material {
+    pub shader_asset: String,
+    pub shader_entry: String,
+    pub shader_profile: String,
+    pub bindings: Vec<ShaderBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ComputeDispatchNode {
     pub label: String,
-    pub shader: String,
+    pub material: Material,
     pub dispatch: [u32; 3],
     pub reads: Vec<String>,
     pub writes: Vec<String>,
@@ -144,6 +172,7 @@ pub struct RenderPassNode {
     pub label: String,
     pub camera: Camera2d,
     pub target: Option<RenderTargetHandle>,
+    pub material: Option<Material>,
     pub batches: Vec<SpriteBatchCommand>,
 }
 
@@ -183,6 +212,126 @@ pub struct BackendDiagnosticEvent {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FrameCaptureFormat {
+    /// Standard RGBA8 uncompressed image data.
+    Rgba8,
+    /// Backend-specific raw payload (e.g., D3D11 staging texture bytes).
+    Raw,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrameCaptureRequest {
+    pub label: String,
+    pub format: FrameCaptureFormat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct FrameCaptureHandle(pub u64);
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FrameCaptureResult {
+    pub handle: FrameCaptureHandle,
+    pub label: String,
+    pub completed: bool,
+    pub data: Option<Vec<u8>>,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GpuInstrumentationConfig {
+    /// Master switch for GPU timing queries.
+    pub enabled: bool,
+    /// Number of frames between timestamp query resets. Zero means "never reset".
+    pub timestamp_query_period: u32,
+}
+
+/// Shared instrumentation state that backends can embed to implement the
+/// [`GraphicsBackend`] GPU-timer and frame-capture hooks consistently.
+#[derive(Debug, Clone, Default)]
+pub struct BackendInstrumentationState {
+    /// Whether GPU timestamp queries are currently enabled.
+    pub gpu_timestamps_enabled: bool,
+    /// Active instrumentation configuration.
+    pub config: GpuInstrumentationConfig,
+    /// Monotonic handle generator for frame-capture requests.
+    pub next_capture_handle: u64,
+    /// Captures that have been requested but not yet completed.
+    pub pending_captures: Vec<(FrameCaptureHandle, FrameCaptureRequest)>,
+    /// Captures that have finished and are waiting to be polled.
+    pub completed_captures: Vec<FrameCaptureResult>,
+}
+
+impl BackendInstrumentationState {
+    pub fn set_gpu_timestamps_enabled(&mut self, enabled: bool) {
+        self.gpu_timestamps_enabled = enabled;
+    }
+
+    pub fn configure(&mut self, config: GpuInstrumentationConfig) {
+        self.config = config;
+        self.gpu_timestamps_enabled = config.enabled;
+    }
+
+    pub fn request_capture(
+        &mut self,
+        request: FrameCaptureRequest,
+    ) -> FrameCaptureHandle {
+        let handle = FrameCaptureHandle(self.next_capture_handle);
+        self.next_capture_handle += 1;
+        self.pending_captures.push((handle, request));
+        handle
+    }
+
+    /// Marks the oldest pending capture as completed with the supplied payload.
+    /// If no capture is pending, the payload is discarded.
+    pub fn complete_oldest_capture(
+        &mut self,
+        width: u32,
+        height: u32,
+        data: Vec<u8>,
+    ) {
+        if let Some((handle, request)) = self.pending_captures.pop() {
+            self.completed_captures.push(FrameCaptureResult {
+                handle,
+                label: request.label,
+                completed: true,
+                data: Some(data),
+                width,
+                height,
+            });
+        }
+    }
+
+    /// Polls a capture handle. Returns the completed result if available, or an
+    /// in-flight marker otherwise.
+    pub fn poll_capture(
+        &mut self,
+        handle: FrameCaptureHandle,
+    ) -> Option<FrameCaptureResult> {
+        if let Some(index) = self
+            .completed_captures
+            .iter()
+            .position(|result| result.handle == handle)
+        {
+            return Some(self.completed_captures.remove(index));
+        }
+
+        if self.pending_captures.iter().any(|(h, _)| *h == handle) {
+            return Some(FrameCaptureResult {
+                handle,
+                label: String::new(),
+                completed: false,
+                data: None,
+                width: 0,
+                height: 0,
+            });
+        }
+
+        None
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BackendPassTiming {
     pub frame: u64,
@@ -200,6 +349,12 @@ pub struct BackendDiagnostics {
     pub fallback_events: u64,
     pub swapchain_recreates: u64,
     pub device_loss_events: u64,
+    /// True when the backend has GPU timestamp queries enabled.
+    pub gpu_timestamps_enabled: bool,
+    /// Number of frame-capture requests that have not yet completed.
+    pub frame_captures_pending: u64,
+    /// Number of frame-capture requests that have completed.
+    pub frame_captures_completed: u64,
     pub events: Vec<BackendDiagnosticEvent>,
     pub pass_timings: Vec<BackendPassTiming>,
 }
@@ -214,6 +369,9 @@ impl BackendDiagnostics {
             fallback_events: 0,
             swapchain_recreates: 0,
             device_loss_events: 0,
+            gpu_timestamps_enabled: false,
+            frame_captures_pending: 0,
+            frame_captures_completed: 0,
             events: Vec::new(),
             pass_timings: Vec::new(),
         }
@@ -356,7 +514,52 @@ pub trait GraphicsBackend {
 
     fn readback_viewport(&mut self) -> Result<Option<ViewportReadback>, BackendError>;
 
+    /// Optionally preload a shader bytecode blob that the backend can use for
+    /// subsequent render/compute passes. Backends that do not support runtime
+    /// shader loading can ignore this. The default implementation is a no-op.
+    fn preload_shader_bytecode(
+        &mut self,
+        _name: &str,
+        _entry_point: &str,
+        _bytecode: &[u8],
+    ) -> Result<(), BackendError> {
+        Ok(())
+    }
+
     fn destroy(&mut self) -> Result<(), BackendError>;
+
+    // GPU instrumentation and frame capture hooks. Backends may override these
+    // to expose hardware timers, timestamp queries, and frame-capture payloads.
+    // The default implementations are no-ops that report "not supported" so
+    // callers can use them without branching on backend kind.
+
+    /// Enables or disables GPU timestamp/instrumentation collection.
+    fn set_gpu_timestamps_enabled(&mut self, _enabled: bool) {}
+
+    /// Configures GPU instrumentation parameters.
+    fn configure_gpu_instrumentation(&mut self, _config: GpuInstrumentationConfig) {}
+
+    /// Requests a frame capture. The returned handle can be polled with
+    /// [`GraphicsBackend::poll_frame_capture`].
+    fn request_frame_capture(
+        &mut self,
+        _request: FrameCaptureRequest,
+    ) -> Result<FrameCaptureHandle, BackendError> {
+        Err(BackendError::Runtime(
+            "frame capture not supported by this backend".into(),
+        ))
+    }
+
+    /// Polls a previously requested frame capture. Returns `completed: false`
+    /// while the capture is still in flight.
+    fn poll_frame_capture(
+        &mut self,
+        _handle: FrameCaptureHandle,
+    ) -> Result<FrameCaptureResult, BackendError> {
+        Err(BackendError::Runtime(
+            "frame capture not supported by this backend".into(),
+        ))
+    }
 }
 
 pub fn required_backend_features() -> [&'static str; 6] {
@@ -368,4 +571,102 @@ pub fn required_backend_features() -> [&'static str; 6] {
         "offscreen_targets",
         "texture_atlas",
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backend_error_recoverable_surface() {
+        let err = BackendError::SurfaceOutOfDate("out of date".into());
+        assert!(err.is_recoverable_surface());
+        assert!(!err.is_recoverable_device());
+    }
+
+    #[test]
+    fn backend_error_recoverable_device() {
+        let lost = BackendError::DeviceLost("lost".into());
+        let removed = BackendError::DeviceRemoved("removed".into());
+        assert!(lost.is_recoverable_device());
+        assert!(removed.is_recoverable_device());
+        assert!(!lost.is_recoverable_surface());
+    }
+
+    #[test]
+    fn backend_diagnostics_event_ring_buffer() {
+        let mut diag = BackendDiagnostics::new(BackendKind::Vulkan);
+        for i in 0..300 {
+            diag.push_event(BackendDiagnosticEvent {
+                level: BackendDiagnosticLevel::Info,
+                frame: Some(i as u64),
+                pass: None,
+                message: format!("event {i}"),
+            });
+        }
+        assert_eq!(diag.events.len(), 256);
+        assert_eq!(diag.events.first().unwrap().frame, Some(44));
+        assert_eq!(diag.events.last().unwrap().frame, Some(299));
+    }
+
+    #[test]
+    fn backend_diagnostics_pass_timing_ring_buffer() {
+        let mut diag = BackendDiagnostics::new(BackendKind::Dx12);
+        for i in 0..600 {
+            diag.push_pass_timing(BackendPassTiming {
+                frame: i as u64,
+                pass: "pass".into(),
+                cpu_ms: 1.0,
+                gpu_ms: None,
+            });
+        }
+        assert_eq!(diag.pass_timings.len(), 512);
+        assert_eq!(diag.pass_timings.first().unwrap().frame, 88);
+        assert_eq!(diag.pass_timings.last().unwrap().frame, 599);
+    }
+
+    #[test]
+    fn backend_capabilities_supports_required_2d() {
+        let caps = BackendCapabilities {
+            textured_sprites: true,
+            batching: true,
+            camera_transforms: true,
+            blend_modes: true,
+            offscreen_targets: true,
+            texture_atlas: true,
+            gpu_nodes: false,
+            hybrid_nodes: false,
+            compute_nodes: false,
+            viewport_readback: false,
+        };
+        assert!(caps.supports_required_2d());
+
+        let mut missing = caps;
+        missing.batching = false;
+        assert!(!missing.supports_required_2d());
+    }
+
+    #[test]
+    fn surface_config_from_engine_config_preserves_window_and_vsync() {
+        let config = EngineConfig::default();
+        let surface = SurfaceConfig::from_engine_config(&config);
+        assert_eq!(surface.width, config.window.width);
+        assert_eq!(surface.height, config.window.height);
+        assert_eq!(surface.vsync, config.vsync);
+        assert!(!surface.headless);
+    }
+
+    #[test]
+    fn viewport_buffer_size_checked() {
+        assert_eq!(ViewportReadback::buffer_size(2, 3), Some(24));
+        assert_eq!(ViewportReadback::buffer_size(0, 100), Some(0));
+        assert!(ViewportReadback::buffer_size(u32::MAX, u32::MAX).is_none());
+    }
+
+    #[test]
+    fn render_graph_empty_is_empty() {
+        let graph = RenderGraph::empty();
+        assert!(graph.resources.is_empty());
+        assert!(graph.passes.is_empty());
+    }
 }

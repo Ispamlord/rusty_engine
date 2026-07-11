@@ -344,6 +344,9 @@ pub enum AssetError {
 
     #[error("shader compile error: {0}")]
     ShaderCompile(String),
+
+    #[error("shader include error: {0}")]
+    UnresolvedInclude(String),
 }
 
 impl AssetHotReload {
@@ -600,9 +603,17 @@ pub fn parse_shader_metadata(source: &str) -> Result<ShaderMetadata, AssetError>
 
             for token in raw_binding.split_whitespace() {
                 if let Some(value) = token.strip_prefix("set=") {
-                    set = value.parse::<u32>().ok();
+                    set = Some(value.parse::<u32>().map_err(|_| {
+                        AssetError::ShaderParse(format!(
+                            "binding directive has invalid 'set' value: {value}"
+                        ))
+                    })?);
                 } else if let Some(value) = token.strip_prefix("binding=") {
-                    binding = value.parse::<u32>().ok();
+                    binding = Some(value.parse::<u32>().map_err(|_| {
+                        AssetError::ShaderParse(format!(
+                            "binding directive has invalid 'binding' value: {value}"
+                        ))
+                    })?);
                 } else if let Some(value) = token.strip_prefix("name=") {
                     name = Some(value.to_string());
                 }
@@ -735,14 +746,14 @@ fn resolve_includes_inner(
             continue;
         }
 
-        let Some(start) = line.find('"') else {
-            continue;
-        };
-        let Some(end) = line[start + 1..].find('"') else {
-            continue;
-        };
+        let include_name = extract_quoted_include(line)
+            .ok_or_else(|| {
+                AssetError::UnresolvedInclude(format!(
+                    "unsupported #include syntax in '{}': {line}",
+                    path.display()
+                ))
+            })?;
 
-        let include_name = &line[start + 1..start + 1 + end];
         let mut candidates = Vec::new();
         if let Some(parent) = path.parent() {
             candidates.push(parent.join(include_name));
@@ -751,13 +762,27 @@ fn resolve_includes_inner(
             candidates.push(dir.join(include_name));
         }
 
-        if let Some(include_path) = candidates.into_iter().find(|candidate| candidate.exists()) {
-            ordered.push(include_path.clone());
-            resolve_includes_inner(&include_path, include_dirs, visited, ordered)?;
-        }
+        let include_path = candidates
+            .into_iter()
+            .find(|candidate| candidate.exists())
+            .ok_or_else(|| {
+                AssetError::UnresolvedInclude(format!(
+                    "could not resolve #include '{include_name}' in '{}'",
+                    path.display()
+                ))
+            })?;
+
+        ordered.push(include_path.clone());
+        resolve_includes_inner(&include_path, include_dirs, visited, ordered)?;
     }
 
     Ok(())
+}
+
+fn extract_quoted_include(line: &str) -> Option<&str> {
+    let start = line.find('"')?;
+    let end = line[start + 1..].find('"')?;
+    Some(&line[start + 1..start + 1 + end])
 }
 
 fn compute_compile_key(
@@ -861,10 +886,14 @@ fn compile_external(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        let _ = fs::remove_file(&temp_out);
         return Err(format!("compiler failed for {:?}: {stderr}", target));
     }
 
-    fs::read(&temp_out).map_err(|err| format!("failed to read compiler output: {err}"))
+    let bytecode = fs::read(&temp_out)
+        .map_err(|err| format!("failed to read compiler output: {err}"));
+    let _ = fs::remove_file(&temp_out);
+    bytecode
 }
 
 fn placeholder_bytecode(target: ShaderTarget, compile_key: &str, entry: &str) -> Vec<u8> {
@@ -961,6 +990,83 @@ mod tests {
         assert_eq!(metadata.entry_point, "cs_main");
         assert_eq!(metadata.bindings.len(), 2);
         assert_eq!(metadata.bindings[0].name, "particles");
+    }
+
+    #[test]
+    fn parse_shader_metadata_rejects_invalid_binding_values() {
+        let source = r#"
+            //@entry cs_main
+            //@binding set=abc binding=0 name=particles
+        "#;
+
+        let result = parse_shader_metadata(source);
+        assert!(
+            matches!(result, Err(AssetError::ShaderParse(_))),
+            "expected shader parse error, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_includes_finds_nested_dependencies() {
+        let temp_dir = std::env::temp_dir().join("rusty_engine_include_test");
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).expect("temp dir should exist");
+
+        let header_path = temp_dir.join("common.hlsl");
+        let source_path = temp_dir.join("main.hlsl");
+
+        fs::write(&header_path, "//@entry main\n").expect("header should be written");
+        fs::write(
+            &source_path,
+            r#"#include "common.hlsl"
+//@entry cs_main
+"#,
+        )
+        .expect("source should be written");
+
+        let options = ShaderCompileOptions::default();
+        let artifact = compile_shader_file(
+            &source_path,
+            ShaderSourceKind::Hlsl,
+            ShaderTarget::Dx12Dxil,
+            &options,
+        )
+        .expect("compile should succeed");
+
+        assert!(artifact.include_files.contains(&header_path));
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn resolve_includes_errors_on_missing_file() {
+        let temp_dir = std::env::temp_dir().join("rusty_engine_include_missing_test");
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).expect("temp dir should exist");
+
+        let source_path = temp_dir.join("main.hlsl");
+        fs::write(
+            &source_path,
+            r#"#include "nonexistent.hlsl"
+//@entry cs_main
+"#,
+        )
+        .expect("source should be written");
+
+        let options = ShaderCompileOptions::default();
+        let result = compile_shader_file(
+            &source_path,
+            ShaderSourceKind::Hlsl,
+            ShaderTarget::Dx12Dxil,
+            &options,
+        );
+
+        assert!(
+            matches!(result, Err(AssetError::UnresolvedInclude(_))),
+            "expected unresolved include error, got {result:?}"
+        );
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 
     #[test]

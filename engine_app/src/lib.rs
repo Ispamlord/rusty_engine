@@ -104,7 +104,7 @@ impl Default for ViewportReadbackBalancer {
 impl ViewportReadbackBalancer {
     fn should_capture(&mut self) -> bool {
         self.frame_cursor = self.frame_cursor.wrapping_add(1);
-        self.frame_cursor % self.interval_frames.max(1) == 0
+        self.frame_cursor.is_multiple_of(self.interval_frames.max(1))
     }
 
     fn update_from_frame_time(&mut self, frame_ms: f32, target_ms: f32) {
@@ -180,7 +180,7 @@ impl ScriptSchedulerConfig {
 
         let biased = match config.topology_bias {
             SchedulerTopologyBias::Balanced => usable,
-            SchedulerTopologyBias::PreferHighClock => ((usable + 1) / 2).max(1),
+            SchedulerTopologyBias::PreferHighClock => usable.div_ceil(2).max(1),
             SchedulerTopologyBias::PreferManyCore => usable,
         };
 
@@ -258,17 +258,22 @@ fn collider_half_extents(collider: &Collider2D) -> (f32, f32) {
     }
 }
 
-fn aabb_overlaps(
-    ax: f32,
-    ay: f32,
-    ahx: f32,
-    ahy: f32,
-    bx: f32,
-    by: f32,
-    bhx: f32,
-    bhy: f32,
-) -> bool {
-    (ax - bx).abs() <= ahx + bhx && (ay - by).abs() <= ahy + bhy
+struct Aabb {
+    x: f32,
+    y: f32,
+    half_w: f32,
+    half_h: f32,
+}
+
+impl Aabb {
+    fn overlaps(self, other: Self) -> bool {
+        (self.x - other.x).abs() <= self.half_w + other.half_w
+            && (self.y - other.y).abs() <= self.half_h + other.half_h
+    }
+}
+
+fn aabb_overlaps(a: Aabb, b: Aabb) -> bool {
+    a.overlaps(b)
 }
 
 fn move_object_with_collision(scene: &mut SceneDocument, object_id: u64, dx: f32, dy: f32) -> bool {
@@ -304,14 +309,18 @@ fn move_object_with_collision(scene: &mut SceneDocument, object_id: u64, dx: f32
 
         let (other_hx, other_hy) = collider_half_extents(other_collider);
         aabb_overlaps(
-            next_x,
-            next_y,
-            self_hx,
-            self_hy,
-            other.components.transform.x,
-            other.components.transform.y,
-            other_hx,
-            other_hy,
+            Aabb {
+                x: next_x,
+                y: next_y,
+                half_w: self_hx,
+                half_h: self_hy,
+            },
+            Aabb {
+                x: other.components.transform.x,
+                y: other.components.transform.y,
+                half_w: other_hx,
+                half_h: other_hy,
+            },
         )
     });
 
@@ -329,6 +338,11 @@ fn normalize_legacy_rhai_source(source: &str) -> String {
     source.replace("let mut ", "let ")
 }
 
+fn clamp_sprite_dimension(value: i64) -> u32 {
+    // Ensure positive, non-zero dimensions and avoid truncation overflow.
+    (value.max(1) as u64).min(u32::MAX as u64) as u32
+}
+
 fn parse_bool_setting(value: &str) -> Option<bool> {
     match value.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Some(true),
@@ -338,9 +352,43 @@ fn parse_bool_setting(value: &str) -> Option<bool> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum ScriptJobAccessKey {
+enum ScriptJobAccessProfile {
+    /// Job may access arbitrary global state; it cannot run in parallel with any other job.
     Global,
-    Key(String),
+    /// Job declares explicit read/write sets. Two jobs with scoped profiles conflict iff any
+    /// write set intersects another job's read or write set.
+    Scoped {
+        reads: HashSet<String>,
+        writes: HashSet<String>,
+    },
+}
+
+impl ScriptJobAccessProfile {
+    fn conflicts_with(&self,
+        other: &ScriptJobAccessProfile,
+    ) -> bool {
+        match (self, other) {
+            (ScriptJobAccessProfile::Global, _) | (_, ScriptJobAccessProfile::Global) => true,
+            (
+                ScriptJobAccessProfile::Scoped { reads: a_reads, writes: a_writes },
+                ScriptJobAccessProfile::Scoped { reads: b_reads, writes: b_writes },
+            ) => {
+                // WAW, RAW, and WAR conflicts are all unsafe for parallel execution.
+                !a_writes.is_disjoint(b_writes)
+                    || !a_writes.is_disjoint(b_reads)
+                    || !b_writes.is_disjoint(a_reads)
+            }
+        }
+    }
+}
+
+fn parse_comma_separated_set(value: &str) -> HashSet<String> {
+    value
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_ascii_lowercase())
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -367,11 +415,20 @@ fn create_rhai_engine(host_state: Arc<Mutex<ScriptHostState>>) -> RhaiEngine {
             let Ok(mut state) = host.lock() else {
                 return -1;
             };
-            let next_id = if state.next_object_id == 0 {
+            let mut next_id = if state.next_object_id == 0 {
                 1000
             } else {
                 state.next_object_id
             };
+            if let Some(scene) = state.scene.as_ref() {
+                let max_existing = scene
+                    .objects
+                    .iter()
+                    .map(|object| object.object_id)
+                    .max()
+                    .unwrap_or(0);
+                next_id = next_id.max(max_existing.saturating_add(1));
+            }
             state.next_object_id = next_id.saturating_add(1);
             let object = SceneObject {
                 object_id: next_id,
@@ -391,6 +448,9 @@ fn create_rhai_engine(host_state: Arc<Mutex<ScriptHostState>>) -> RhaiEngine {
     {
         let host = host_state.clone();
         engine.register_fn("despawn_object", move |id: i64| {
+            if id < 0 {
+                return;
+            }
             if let Ok(mut state) = host.lock() {
                 if let Some(scene) = state.scene_mut() {
                     scene.objects.retain(|object| object.object_id != id as u64);
@@ -448,8 +508,8 @@ fn create_rhai_engine(host_state: Arc<Mutex<ScriptHostState>>) -> RhaiEngine {
                     state.with_object_mut(id as u64, |object| {
                         object.components.sprite = Some(Sprite2D {
                             texture_asset: texture.to_string(),
-                            width: width.max(1) as u32,
-                            height: height.max(1) as u32,
+                            width: clamp_sprite_dimension(width),
+                            height: clamp_sprite_dimension(height),
                             tint_rgba: [255, 255, 255, 255],
                             layer_order: 0,
                         });
@@ -763,6 +823,13 @@ impl ScriptRuntime {
         self.scheduler.topology_bias
     }
 
+    fn drain_host_state(&mut self) {
+        if let Ok(mut state) = self.host_state.lock() {
+            state.events.clear();
+            state.logs.clear();
+        }
+    }
+
     fn execute_jobs(&mut self, jobs: &[ScriptJobDescriptor]) -> Result<(), EngineAppError> {
         if jobs.is_empty() {
             return Ok(());
@@ -908,14 +975,15 @@ impl ScriptRuntime {
             return false;
         }
 
-        let mut seen = HashSet::new();
-        for job in wave_jobs {
-            match Self::job_access_key(job) {
-                ScriptJobAccessKey::Global => return false,
-                ScriptJobAccessKey::Key(key) => {
-                    if !seen.insert(key) {
-                        return false;
-                    }
+        let profiles: Vec<_> = wave_jobs
+            .iter()
+            .map(|job| Self::job_access_profile(job))
+            .collect();
+
+        for i in 0..profiles.len() {
+            for j in (i + 1)..profiles.len() {
+                if profiles[i].conflicts_with(&profiles[j]) {
+                    return false;
                 }
             }
         }
@@ -923,7 +991,7 @@ impl ScriptRuntime {
         true
     }
 
-    fn job_access_key(job: &ScriptJobDescriptor) -> ScriptJobAccessKey {
+    fn job_access_profile(job: &ScriptJobDescriptor) -> ScriptJobAccessProfile {
         let explicitly_safe = job
             .settings
             .get("parallel_safe")
@@ -931,44 +999,63 @@ impl ScriptRuntime {
             .unwrap_or(false);
 
         if !explicitly_safe {
-            return ScriptJobAccessKey::Global;
+            return ScriptJobAccessProfile::Global;
         }
 
-        if let Some(value) = job
+        // Prefer explicit read/write sets when available.
+        let read_set = job
+            .settings
+            .get("read_set")
+            .map(|value| parse_comma_separated_set(value))
+            .unwrap_or_default();
+        let write_set = job
+            .settings
+            .get("write_set")
+            .map(|value| parse_comma_separated_set(value))
+            .unwrap_or_default();
+
+        if !read_set.is_empty() || !write_set.is_empty() {
+            return ScriptJobAccessProfile::Scoped { reads: read_set, writes: write_set };
+        }
+
+        // Fall back to a single synthetic write key for the legacy parallel-safe
+        // markers. This preserves behavior for existing nodes that rely on
+        // script_parallel_key / object_id / object_name / layer_id.
+        let legacy_key = job
             .settings
             .get("script_parallel_key")
-            .map(|value| value.trim())
+            .map(|value| value.trim().to_ascii_lowercase())
             .filter(|value| !value.is_empty())
-        {
-            return ScriptJobAccessKey::Key(format!("key:{value}"));
+            .or_else(|| {
+                job.settings
+                    .get("object_id")
+                    .and_then(|value| value.trim().parse::<u64>().ok())
+                    .map(|id| format!("object:{id}"))
+            })
+            .or_else(|| {
+                job.settings
+                    .get("object_name")
+                    .map(|value| value.trim().to_ascii_lowercase())
+                    .filter(|value| !value.is_empty())
+                    .map(|name| format!("object_name:{name}"))
+            })
+            .or_else(|| {
+                job.settings
+                    .get("layer_id")
+                    .and_then(|value| value.trim().parse::<u64>().ok())
+                    .map(|id| format!("layer:{id}"))
+            });
+
+        if let Some(key) = legacy_key {
+            let mut writes = HashSet::new();
+            writes.insert(key);
+            return ScriptJobAccessProfile::Scoped {
+                reads: HashSet::new(),
+                writes,
+            };
         }
 
-        if let Some(value) = job
-            .settings
-            .get("object_id")
-            .and_then(|value| value.trim().parse::<u64>().ok())
-        {
-            return ScriptJobAccessKey::Key(format!("object:{value}"));
-        }
-
-        if let Some(value) = job
-            .settings
-            .get("object_name")
-            .map(|value| value.trim())
-            .filter(|value| !value.is_empty())
-        {
-            return ScriptJobAccessKey::Key(format!("object_name:{value}"));
-        }
-
-        if let Some(value) = job
-            .settings
-            .get("layer_id")
-            .and_then(|value| value.trim().parse::<u64>().ok())
-        {
-            return ScriptJobAccessKey::Key(format!("layer:{value}"));
-        }
-
-        ScriptJobAccessKey::Global
+        ScriptJobAccessProfile::Global
     }
 
     fn build_script_waves(jobs: &[ScriptJobDescriptor]) -> Vec<Vec<usize>> {
@@ -1029,6 +1116,10 @@ impl ScriptRuntime {
         }
 
         if processed != jobs.len() {
+            tracing::warn!(
+                "script dependency graph contains a cycle or missing dependency; \
+                 falling back to sequential execution"
+            );
             vec![(0..jobs.len()).collect()]
         } else {
             waves
@@ -1533,6 +1624,7 @@ impl EngineApp {
             self.gameplay_schedule.run(&mut self.world);
             if let Some(artifact) = &self.compiled_graph {
                 self.script_runtime.execute_jobs(&artifact.script_jobs)?;
+                self.script_runtime.drain_host_state();
                 if let Some(scene) = self.script_runtime.take_scene() {
                     self.current_scene = Some(scene);
                 }
@@ -1553,7 +1645,8 @@ impl EngineApp {
             let mut submission_graph = artifact.render_graph.clone();
             self.inject_scene_sprites_into_render_graph(&mut submission_graph);
             self.apply_viewport_camera_to_render_graph(&mut submission_graph);
-            let submission_graph = optimize_submission_graph(&submission_graph);
+            optimize_submission_graph(&mut submission_graph);
+            self.preload_shaders_for_graph(&submission_graph)?;
             self.backend.record_render_graph(frame, &submission_graph)?;
 
             if let Some(mut runtime_state) = self.world.get_resource_mut::<GraphRuntimeState>() {
@@ -1581,6 +1674,60 @@ impl EngineApp {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn preload_shaders_for_graph(
+        &mut self,
+        graph: &RenderGraph,
+    ) -> Result<(), EngineAppError> {
+        let target = shader_target_for_backend(self.active_backend);
+        let mut seen = HashSet::<String>::new();
+
+        for pass in &graph.passes {
+            let material = match pass {
+                RenderGraphPass::Render(node) => node.material.as_ref(),
+                RenderGraphPass::Compute(node) => Some(&node.material),
+            };
+            let Some(material) = material else {
+                continue;
+            };
+            if material.shader_asset.is_empty() || !seen.insert(material.shader_asset.clone()) {
+                continue;
+            }
+
+            let path = Path::new(&material.shader_asset);
+            let source_kind = shader_source_kind(path).unwrap_or(ShaderSourceKind::Hlsl);
+            let options = ShaderCompileOptions {
+                toolchain: self.config.shader_toolchain.clone(),
+                optimization: "O2".to_string(),
+                include_dirs: vec![path.parent().unwrap_or(Path::new(".")).to_path_buf()],
+            };
+
+            match self.build_cache.build_or_reuse_shader(path, source_kind, target, &options) {
+                Ok((artifact, _)) => {
+                    self.backend
+                        .preload_shader_bytecode(
+                            &material.shader_asset,
+                            &artifact.metadata.entry_point,
+                            &artifact.bytecode,
+                        )
+                        .map_err(EngineAppError::Backend)?;
+                }
+                Err(err) => {
+                    self.push_backend_event(
+                        BackendDiagnosticLevel::Warning,
+                        None,
+                        None,
+                        format!(
+                            "shader preload failed for {}: {err}; using built-in fallback",
+                            material.shader_asset
+                        ),
+                    );
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -1636,9 +1783,22 @@ impl EngineApp {
         }
 
         let target = Duration::from_secs_f32(1.0 / self.config.frame_pacing.target_fps as f32);
-        let elapsed = frame_start.elapsed();
-        if target > elapsed {
-            thread::sleep(target - elapsed);
+        let spin_threshold = Duration::from_millis(2);
+
+        // Sleep for the bulk of the remaining time, then spin-yield for the
+        // last couple of milliseconds to avoid OS sleep granularity overshoot
+        // (especially noticeable on Windows, where Sleep can drift by 10-15 ms).
+        loop {
+            let elapsed = frame_start.elapsed();
+            if elapsed >= target {
+                return;
+            }
+            let remaining = target - elapsed;
+            if remaining >= spin_threshold {
+                thread::sleep(remaining - spin_threshold);
+            } else {
+                thread::yield_now();
+            }
         }
     }
 
@@ -2072,10 +2232,8 @@ fn texture_handle_from_asset(asset: &str) -> TextureHandle {
     TextureHandle((hasher.finish() % 32) + 3)
 }
 
-fn optimize_submission_graph(graph: &RenderGraph) -> RenderGraph {
-    let mut optimized = graph.clone();
-
-    for pass in &mut optimized.passes {
+fn optimize_submission_graph(graph: &mut RenderGraph) {
+    for pass in &mut graph.passes {
         if let RenderGraphPass::Render(render) = pass {
             for batch in &mut render.batches {
                 let blend_key = blend_sort_key(batch.blend);
@@ -2093,8 +2251,6 @@ fn optimize_submission_graph(graph: &RenderGraph) -> RenderGraph {
             });
         }
     }
-
-    optimized
 }
 
 fn blend_sort_key(blend: engine_render_api::BlendMode) -> u8 {
@@ -2128,7 +2284,7 @@ mod tests {
     use engine_assets::save_node_graph;
     use engine_nodes::{
         ComputeDispatchConfig, GpuResourceAccess, Node, NodeExecutionTarget, NodeFallbackPolicy,
-        NodeGraph, NodeKind, NodePayload,
+        NodeGraph, NodeKind, NodePayload, ScriptJobDescriptor,
     };
     use std::collections::BTreeMap;
 
@@ -2306,5 +2462,373 @@ mod tests {
         assert!(report.changed_assets >= 1);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn runtime_input_state_maps_directional_keys() {
+        let input = RuntimeInputState {
+            left: true,
+            right: false,
+            up: true,
+            down: false,
+        };
+        assert!(input.key_down("left"));
+        assert!(input.key_down("a"));
+        assert!(input.key_down("ArrowLeft"));
+        assert!(input.key_down("up"));
+        assert!(input.key_down("w"));
+        assert!(!input.key_down("right"));
+        assert!(!input.key_down("unknown"));
+    }
+
+    #[test]
+    fn viewport_readback_balancer_defaults_to_one() {
+        let mut balancer = ViewportReadbackBalancer::default();
+        assert!(balancer.should_capture());
+        assert!(balancer.should_capture());
+    }
+
+    #[test]
+    fn viewport_readback_balancer_slows_down_when_over_budget() {
+        let mut balancer = ViewportReadbackBalancer::default();
+        balancer.update_from_frame_time(20.0, 16.67);
+        assert_eq!(balancer.interval_frames(), 2);
+    }
+
+    #[test]
+    fn viewport_readback_balancer_speeds_up_when_under_budget() {
+        let mut balancer = ViewportReadbackBalancer {
+            interval_frames: 4,
+            frame_cursor: 0,
+        };
+        balancer.update_from_frame_time(10.0, 16.67);
+        assert_eq!(balancer.interval_frames(), 3);
+    }
+
+    #[test]
+    fn collider_half_extents_for_circle_uses_radius() {
+        let collider = Collider2D {
+            shape: "circle".into(),
+            radius: 10.0,
+            width: 0.0,
+            height: 0.0,
+            is_sensor: false,
+        };
+        assert_eq!(collider_half_extents(&collider), (10.0, 10.0));
+    }
+
+    #[test]
+    fn collider_half_extents_for_box_uses_width_height() {
+        let collider = Collider2D {
+            shape: "box".into(),
+            radius: 0.0,
+            width: 20.0,
+            height: 40.0,
+            is_sensor: false,
+        };
+        assert_eq!(collider_half_extents(&collider), (10.0, 20.0));
+    }
+
+    #[test]
+    fn aabb_overlap_detects_intersection() {
+        let a = Aabb {
+            x: 0.0,
+            y: 0.0,
+            half_w: 5.0,
+            half_h: 5.0,
+        };
+        let b = Aabb {
+            x: 8.0,
+            y: 0.0,
+            half_w: 5.0,
+            half_h: 5.0,
+        };
+        assert!(aabb_overlaps(a, b));
+    }
+
+    #[test]
+    fn aabb_overlap_respects_separation() {
+        let a = Aabb {
+            x: 0.0,
+            y: 0.0,
+            half_w: 5.0,
+            half_h: 5.0,
+        };
+        let b = Aabb {
+            x: 20.0,
+            y: 0.0,
+            half_w: 5.0,
+            half_h: 5.0,
+        };
+        assert!(!aabb_overlaps(a, b));
+    }
+
+    #[test]
+    fn move_object_with_collision_allows_free_move() {
+        let mut scene = SceneDocument::new_default();
+        scene.objects.push(SceneObject {
+            object_id: 10,
+            parent: None,
+            layer_id: 1,
+            name: "player".into(),
+            tags: Vec::new(),
+            components: SceneComponents {
+                transform: Transform2D {
+                    x: 0.0,
+                    y: 0.0,
+                    rotation_radians: 0.0,
+                    scale_x: 1.0,
+                    scale_y: 1.0,
+                },
+                collider: Some(Collider2D {
+                    shape: "box".into(),
+                    radius: 0.0,
+                    width: 10.0,
+                    height: 10.0,
+                    is_sensor: false,
+                }),
+                ..Default::default()
+            },
+        });
+
+        assert!(move_object_with_collision(&mut scene, 10, 5.0, 0.0));
+        assert_eq!(
+            scene
+                .objects
+                .iter()
+                .find(|o| o.object_id == 10)
+                .unwrap()
+                .components
+                .transform
+                .x,
+            5.0
+        );
+    }
+
+    #[test]
+    fn move_object_with_collision_blocks_when_overlapping() {
+        let mut scene = SceneDocument::new_default();
+        scene.objects.push(SceneObject {
+            object_id: 10,
+            parent: None,
+            layer_id: 1,
+            name: "player".into(),
+            tags: Vec::new(),
+            components: SceneComponents {
+                transform: Transform2D {
+                    x: 0.0,
+                    y: 0.0,
+                    rotation_radians: 0.0,
+                    scale_x: 1.0,
+                    scale_y: 1.0,
+                },
+                collider: Some(Collider2D {
+                    shape: "box".into(),
+                    radius: 0.0,
+                    width: 10.0,
+                    height: 10.0,
+                    is_sensor: false,
+                }),
+                ..Default::default()
+            },
+        });
+        scene.objects.push(SceneObject {
+            object_id: 11,
+            parent: None,
+            layer_id: 1,
+            name: "wall".into(),
+            tags: Vec::new(),
+            components: SceneComponents {
+                transform: Transform2D {
+                    x: 15.0,
+                    y: 0.0,
+                    rotation_radians: 0.0,
+                    scale_x: 1.0,
+                    scale_y: 1.0,
+                },
+                collider: Some(Collider2D {
+                    shape: "box".into(),
+                    radius: 0.0,
+                    width: 10.0,
+                    height: 10.0,
+                    is_sensor: false,
+                }),
+                ..Default::default()
+            },
+        });
+
+        assert!(!move_object_with_collision(&mut scene, 10, 15.0, 0.0));
+        assert_eq!(
+            scene
+                .objects
+                .iter()
+                .find(|o| o.object_id == 10)
+                .unwrap()
+                .components
+                .transform
+                .x,
+            0.0
+        );
+    }
+
+    #[test]
+    fn build_script_waves_detects_cycle_and_falls_back() {
+        let jobs = vec![
+            ScriptJobDescriptor {
+                node_id: 1,
+                node_name: "a".into(),
+                script_asset: "a.rhai".into(),
+                entry: "update".into(),
+                frame_phase: "gameplay".into(),
+                dependencies: vec![2],
+                settings: BTreeMap::new(),
+            },
+            ScriptJobDescriptor {
+                node_id: 2,
+                node_name: "b".into(),
+                script_asset: "b.rhai".into(),
+                entry: "update".into(),
+                frame_phase: "gameplay".into(),
+                dependencies: vec![1],
+                settings: BTreeMap::new(),
+            },
+        ];
+
+        let waves = ScriptRuntime::build_script_waves(&jobs);
+        assert_eq!(waves.len(), 1);
+        assert_eq!(waves[0].len(), 2);
+    }
+
+    #[test]
+    fn clamp_sprite_dimension_rejects_zero_and_negative() {
+        assert_eq!(clamp_sprite_dimension(0), 1);
+        assert_eq!(clamp_sprite_dimension(-5), 1);
+    }
+
+    #[test]
+    fn clamp_sprite_dimension_clamps_to_u32_max() {
+        assert_eq!(clamp_sprite_dimension(i64::MAX), u32::MAX);
+    }
+
+    fn job_with_settings(settings: BTreeMap<String, String>) -> ScriptJobDescriptor {
+        ScriptJobDescriptor {
+            node_id: 1,
+            node_name: "test".into(),
+            script_asset: "test.rhai".into(),
+            entry: "update".into(),
+            frame_phase: "gameplay".into(),
+            dependencies: vec![],
+            settings,
+        }
+    }
+
+    #[test]
+    fn access_profile_disjoint_read_write_sets_can_parallelize() {
+        let a = ScriptRuntime::job_access_profile(
+            &job_with_settings(BTreeMap::from([
+                ("parallel_safe".into(), "true".into()),
+                ("read_set".into(), "health".into()),
+                ("write_set".into(), "player".into()),
+            ])),
+        );
+        let b = ScriptRuntime::job_access_profile(
+            &job_with_settings(BTreeMap::from([
+                ("parallel_safe".into(), "true".into()),
+                ("read_set".into(), "enemies".into()),
+                ("write_set".into(), "score".into()),
+            ])),
+        );
+        assert!(!a.conflicts_with(&b));
+    }
+
+    #[test]
+    fn access_profile_write_write_conflict_blocks_parallelism() {
+        let a = ScriptRuntime::job_access_profile(
+            &job_with_settings(BTreeMap::from([
+                ("parallel_safe".into(), "true".into()),
+                ("write_set".into(), "score".into()),
+            ])),
+        );
+        let b = ScriptRuntime::job_access_profile(
+            &job_with_settings(BTreeMap::from([
+                ("parallel_safe".into(), "true".into()),
+                ("write_set".into(), "score".into()),
+            ])),
+        );
+        assert!(a.conflicts_with(&b));
+    }
+
+    #[test]
+    fn access_profile_read_write_conflict_blocks_parallelism() {
+        let a = ScriptRuntime::job_access_profile(
+            &job_with_settings(BTreeMap::from([
+                ("parallel_safe".into(), "true".into()),
+                ("write_set".into(), "health".into()),
+            ])),
+        );
+        let b = ScriptRuntime::job_access_profile(
+            &job_with_settings(BTreeMap::from([
+                ("parallel_safe".into(), "true".into()),
+                ("read_set".into(), "health".into()),
+            ])),
+        );
+        assert!(a.conflicts_with(&b));
+    }
+
+    #[test]
+    fn access_profile_legacy_parallel_key_still_works() {
+        let a = ScriptRuntime::job_access_profile(
+            &job_with_settings(BTreeMap::from([
+                ("parallel_safe".into(), "true".into()),
+                ("script_parallel_key".into(), "group_a".into()),
+            ])),
+        );
+        let b = ScriptRuntime::job_access_profile(
+            &job_with_settings(BTreeMap::from([
+                ("parallel_safe".into(), "true".into()),
+                ("script_parallel_key".into(), "group_b".into()),
+            ])),
+        );
+        assert!(!a.conflicts_with(&b));
+
+        let c = ScriptRuntime::job_access_profile(
+            &job_with_settings(BTreeMap::from([
+                ("parallel_safe".into(), "true".into()),
+                ("script_parallel_key".into(), "group_a".into()),
+            ])),
+        );
+        assert!(a.conflicts_with(&c));
+    }
+
+    #[test]
+    fn access_profile_unsafe_job_conflicts_with_everything() {
+        let safe = ScriptRuntime::job_access_profile(
+            &job_with_settings(BTreeMap::from([
+                ("parallel_safe".into(), "true".into()),
+                ("read_set".into(), "x".into()),
+            ])),
+        );
+        let unsafe_job = ScriptRuntime::job_access_profile(
+            &job_with_settings(BTreeMap::new()),
+        );
+        assert!(safe.conflicts_with(&unsafe_job));
+        assert!(unsafe_job.conflicts_with(&safe));
+    }
+
+    #[test]
+    fn access_profile_case_insensitive_keys() {
+        let a = ScriptRuntime::job_access_profile(
+            &job_with_settings(BTreeMap::from([
+                ("parallel_safe".into(), "true".into()),
+                ("write_set".into(), "Score".into()),
+            ])),
+        );
+        let b = ScriptRuntime::job_access_profile(
+            &job_with_settings(BTreeMap::from([
+                ("parallel_safe".into(), "true".into()),
+                ("write_set".into(), "score".into()),
+            ])),
+        );
+        assert!(a.conflicts_with(&b));
     }
 }

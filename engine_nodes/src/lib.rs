@@ -13,9 +13,10 @@ pub use custom_registry::{
 };
 
 use engine_render_api::{
-    BackendCapabilities, BackendKind, BlendMode, Camera2d, GraphResourceDescriptor,
-    GraphResourceKind, GraphResourceLifetime, RenderGraph, RenderGraphPass, RenderPassNode,
-    RenderTargetDescriptor, RenderTargetHandle, SpriteBatchCommand, SpriteInstance, TextureHandle,
+    BackendCapabilities, BackendKind, BlendMode, Camera2d, ComputeDispatchNode,
+    GraphResourceDescriptor, GraphResourceKind, GraphResourceLifetime, Material, RenderGraph,
+    RenderGraphPass, RenderPassNode, RenderTargetDescriptor, RenderTargetHandle, ShaderBinding,
+    SpriteBatchCommand, SpriteInstance, TextureHandle,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -114,6 +115,7 @@ pub struct RenderPassPayload {
     pub target_height: u32,
     pub sprite_count: u32,
     pub blend: String,
+    pub shader_asset: String,
 }
 
 impl Default for RenderPassPayload {
@@ -124,6 +126,7 @@ impl Default for RenderPassPayload {
             target_height: 1080,
             sprite_count: 0,
             blend: "alpha".to_string(),
+            shader_asset: "assets/shaders/sprite_default.hlsl".to_string(),
         }
     }
 }
@@ -455,6 +458,12 @@ pub enum NodeCompileError {
     #[error("node graph contains a cycle")]
     CycleDetected,
 
+    #[error("node {node_id} depends on itself")]
+    SelfDependency { node_id: NodeId },
+
+    #[error("internal error: node {node_id} missing from lookup table")]
+    InternalNodeLookup { node_id: NodeId },
+
     #[error("strict gpu mode failed for node {node_id}: {reason}")]
     StrictGpuUnsupported { node_id: NodeId, reason: String },
 
@@ -502,6 +511,9 @@ pub fn validate_graph(graph: &NodeGraph) -> Result<(), NodeCompileError> {
         }
 
         for dependency in &node.dependencies {
+            if *dependency == node.id {
+                return Err(NodeCompileError::SelfDependency { node_id: node.id });
+            }
             if !node_index.contains_key(dependency) {
                 return Err(NodeCompileError::MissingDependency {
                     node_id: node.id,
@@ -587,9 +599,9 @@ pub fn compile_graph(
     let mut node_to_gpu_pass: HashMap<NodeId, usize> = HashMap::new();
 
     for node_id in &node_order {
-        let node = node_index
-            .get(node_id)
-            .expect("node id from topo sort must exist");
+        let node = node_index.get(node_id).ok_or(NodeCompileError::InternalNodeLookup {
+            node_id: *node_id,
+        })?;
 
         let execution = resolve_execution_target(node, options, capabilities, &mut diagnostics)?;
         let phase = phase_for_node_kind(node.kind).to_string();
@@ -689,12 +701,37 @@ pub fn compile_graph(
                     sprites,
                 };
 
+                let entry = node
+                    .shader_entry
+                    .clone()
+                    .unwrap_or_else(|| "vs_main".to_string());
+                let profile = node
+                    .shader_profile
+                    .clone()
+                    .unwrap_or_else(|| default_shader_profile(backend, false).to_string());
+
+                let material = Material {
+                    shader_asset: render_payload.shader_asset.clone(),
+                    shader_entry: entry.clone(),
+                    shader_profile: profile.clone(),
+                    bindings: node
+                        .gpu_bindings
+                        .iter()
+                        .map(|binding| ShaderBinding {
+                            set: binding.set,
+                            binding: binding.binding,
+                            resource: binding.resource.clone(),
+                        })
+                        .collect(),
+                };
+
                 render_graph
                     .passes
                     .push(RenderGraphPass::Render(RenderPassNode {
                         label: node.name.clone(),
                         camera: Camera2d::default(),
                         target: Some(target_handle),
+                        material: Some(material),
                         batches: vec![batch],
                     }));
 
@@ -703,14 +740,8 @@ pub fn compile_graph(
                     backend,
                     label: node.name.clone(),
                     is_compute: false,
-                    shader_entry: node
-                        .shader_entry
-                        .clone()
-                        .unwrap_or_else(|| "vs_main".to_string()),
-                    shader_profile: node
-                        .shader_profile
-                        .clone()
-                        .unwrap_or_else(|| default_shader_profile(backend, false).to_string()),
+                    shader_entry: entry,
+                    shader_profile: profile,
                 });
             }
             NodeKind::ComputePass => {
@@ -749,10 +780,38 @@ pub fn compile_graph(
                     });
                 }
 
+                let entry = node
+                    .shader_entry
+                    .clone()
+                    .unwrap_or_else(|| "cs_main".to_string());
+                let profile = node
+                    .shader_profile
+                    .clone()
+                    .unwrap_or_else(|| default_shader_profile(backend, true).to_string());
+
+                let material = Material {
+                    shader_asset: shader.clone(),
+                    shader_entry: entry.clone(),
+                    shader_profile: profile.clone(),
+                    bindings: reads
+                        .iter()
+                        .map(|resource| ShaderBinding {
+                            set: 0,
+                            binding: 0,
+                            resource: resource.clone(),
+                        })
+                        .chain(writes.iter().map(|resource| ShaderBinding {
+                            set: 0,
+                            binding: 1,
+                            resource: resource.clone(),
+                        }))
+                        .collect(),
+                };
+
                 render_graph.passes.push(RenderGraphPass::Compute(
-                    engine_render_api::ComputeDispatchNode {
+                    ComputeDispatchNode {
                         label: node.name.clone(),
-                        shader,
+                        material,
                         dispatch,
                         reads,
                         writes,
@@ -764,14 +823,8 @@ pub fn compile_graph(
                     backend,
                     label: node.name.clone(),
                     is_compute: true,
-                    shader_entry: node
-                        .shader_entry
-                        .clone()
-                        .unwrap_or_else(|| "cs_main".to_string()),
-                    shader_profile: node
-                        .shader_profile
-                        .clone()
-                        .unwrap_or_else(|| default_shader_profile(backend, true).to_string()),
+                    shader_entry: entry,
+                    shader_profile: profile,
                 });
             }
             _ => {}
@@ -1060,6 +1113,9 @@ fn render_pass_payload(node: &Node) -> RenderPassPayload {
     if let Some(blend) = node.settings.get("blend") {
         payload.blend = blend.clone();
     }
+    if let Some(shader_asset) = node.settings.get("shader_asset") {
+        payload.shader_asset = shader_asset.clone();
+    }
 
     payload
 }
@@ -1279,6 +1335,7 @@ mod tests {
                         target_height: 1080,
                         sprite_count: 4,
                         blend: "alpha".to_string(),
+                        shader_asset: "assets/shaders/sprite_default.hlsl".to_string(),
                     })),
                 },
             ],
@@ -1340,6 +1397,34 @@ mod tests {
 
         let error = validate_graph(&graph).expect_err("cycle should fail validation");
         assert!(matches!(error, NodeCompileError::CycleDetected));
+    }
+
+    #[test]
+    fn validate_graph_rejects_self_dependency() {
+        let graph = NodeGraph {
+            version: CURRENT_GRAPH_VERSION,
+            nodes: vec![Node {
+                id: 1,
+                name: "self".into(),
+                kind: NodeKind::GameplayFlow,
+                target: NodeExecutionTarget::Cpu,
+                dependencies: vec![1],
+                settings: Default::default(),
+                gpu_bindings: vec![],
+                compute: None,
+                fallback_policy: NodeFallbackPolicy::Cpu,
+                gpu_resource_states: vec![],
+                shader_entry: None,
+                shader_profile: None,
+                payload: Some(NodePayload::GameplayFlow(GameplayFlowPayload::default())),
+            }],
+        };
+
+        let error = validate_graph(&graph).expect_err("self dependency should fail validation");
+        assert!(matches!(
+            error,
+            NodeCompileError::SelfDependency { node_id: 1 }
+        ));
     }
 
     #[test]

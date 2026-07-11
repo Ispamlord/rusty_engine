@@ -9,9 +9,9 @@ use engine_assets::{
     Camera2DComponent, Collider2D, SceneDocument, SceneLayer, SceneObject, Sprite2D, Transform2D,
 };
 use engine_nodes::{
-    AssetReferencePayload, BuildExportPayload, CompileDiagnostic, ComputePassPayload,
-    CustomNodePayload, GameplayEventPayload, GameplayFlowPayload, MathStatePayload, Node,
-    NodeExecutionTarget, NodeFallbackPolicy, NodeGraph, NodeId, NodeKind, NodePayload,
+    AssetReferencePayload, BuildExportPayload, CompileDiagnostic, ComputeDispatchConfig,
+    ComputePassPayload, CustomNodePayload, GameplayEventPayload, GameplayFlowPayload, MathStatePayload,
+    Node, NodeExecutionTarget, NodeFallbackPolicy, NodeGraph, NodeId, NodeKind, NodePayload,
     ObjectInitializerPayload, RenderPassPayload, ScriptBehaviorPayload, CURRENT_GRAPH_VERSION,
 };
 use engine_render_api::{
@@ -266,6 +266,11 @@ pub enum EditorCommand {
         node_id: NodeId,
         old: NodeKind,
         new: NodeKind,
+    },
+    SetNodeName {
+        node_id: NodeId,
+        old_name: String,
+        new_name: String,
     },
     SetNodeTarget {
         node_id: NodeId,
@@ -687,7 +692,7 @@ impl EditorProjectState {
         let mut files = Vec::new();
         let asset_root = self.project_root.join("assets");
         if asset_root.exists() {
-            collect_files_recursive(&asset_root, &mut files)?;
+            collect_files_recursive(&asset_root, &mut files, 0)?;
         }
 
         if self.scene_path.exists() && !files.contains(&self.scene_path) {
@@ -828,6 +833,37 @@ impl EditorProjectState {
     }
 }
 
+fn node_graph_has_cycle(nodes: &[Node]) -> bool {
+    let mut color: BTreeMap<NodeId, u8> = BTreeMap::new();
+    let deps: BTreeMap<NodeId, &[NodeId]> = nodes
+        .iter()
+        .map(|node| (node.id, node.dependencies.as_slice()))
+        .collect();
+
+    fn visit(id: NodeId, deps: &BTreeMap<NodeId, &[NodeId]>, color: &mut BTreeMap<NodeId, u8>) -> bool {
+        match color.get(&id).copied().unwrap_or(0) {
+            1 => return true,
+            2 => return false,
+            _ => {}
+        }
+        color.insert(id, 1);
+        for dep in deps.get(&id).copied().unwrap_or(&[]) {
+            if visit(*dep, deps, color) {
+                return true;
+            }
+        }
+        color.insert(id, 2);
+        false
+    }
+
+    for node in nodes {
+        if visit(node.id, &deps, &mut color) {
+            return true;
+        }
+    }
+    false
+}
+
 fn apply_command_internal(
     document: &mut EditorDocument,
     command: &EditorCommand,
@@ -890,16 +926,29 @@ fn apply_command_internal(
                 )));
             }
 
-            let target = document
+            let target_index = document
                 .scene
                 .graph
                 .nodes
-                .iter_mut()
-                .find(|node| node.id == *to)
+                .iter()
+                .position(|node| node.id == *to)
                 .ok_or_else(|| EditorError::Command(format!("missing target node {to}")))?;
-            if !target.dependencies.contains(from) {
-                target.dependencies.push(*from);
-                target.dependencies.sort_unstable();
+            let added = {
+                let deps = &mut document.scene.graph.nodes[target_index].dependencies;
+                if deps.contains(from) {
+                    false
+                } else {
+                    deps.push(*from);
+                    deps.sort_unstable();
+                    true
+                }
+            };
+            if added && node_graph_has_cycle(&document.scene.graph.nodes) {
+                let deps = &mut document.scene.graph.nodes[target_index].dependencies;
+                deps.retain(|dep| dep != from);
+                return Err(EditorError::Command(
+                    "node dependency cycle detected".to_string(),
+                ));
             }
         }
         EditorCommand::DisconnectNodes { from, to } => {
@@ -924,6 +973,21 @@ fn apply_command_internal(
                 .find(|node| node.id == *node_id)
                 .ok_or_else(|| EditorError::Command(format!("missing node {node_id}")))?;
             node.kind = *new;
+            sync_node_payload_from_settings(node);
+        }
+        EditorCommand::SetNodeName {
+            node_id,
+            new_name,
+            ..
+        } => {
+            let node = document
+                .scene
+                .graph
+                .nodes
+                .iter_mut()
+                .find(|node| node.id == *node_id)
+                .ok_or_else(|| EditorError::Command(format!("missing node {node_id}")))?;
+            node.name = new_name.clone();
         }
         EditorCommand::SetNodeTarget { node_id, new, .. } => {
             let node = document
@@ -980,6 +1044,7 @@ fn apply_command_internal(
                     node.settings.remove(key);
                 }
             }
+            sync_node_payload_from_settings(node);
         }
         EditorCommand::AddLayer { layer } => {
             if document
@@ -1302,10 +1367,25 @@ fn validate_document_integrity(document: &EditorDocument) -> Result<(), EditorEr
         }
     }
 
+    if node_graph_has_cycle(&document.scene.graph.nodes) {
+        return Err(EditorError::Command(
+            "node dependency cycle detected".to_string(),
+        ));
+    }
+
     Ok(())
 }
 
-fn collect_files_recursive(root: &Path, output: &mut Vec<PathBuf>) -> Result<(), EditorError> {
+fn collect_files_recursive(
+    root: &Path,
+    output: &mut Vec<PathBuf>,
+    depth: usize,
+) -> Result<(), EditorError> {
+    const MAX_DEPTH: usize = 32;
+    if depth > MAX_DEPTH {
+        return Ok(());
+    }
+
     if root.is_file() {
         output.push(root.to_path_buf());
         return Ok(());
@@ -1319,7 +1399,7 @@ fn collect_files_recursive(root: &Path, output: &mut Vec<PathBuf>) -> Result<(),
         let entry = entry?;
         let path = entry.path();
         if path.is_dir() {
-            collect_files_recursive(&path, output)?;
+            collect_files_recursive(&path, output, depth.saturating_add(1))?;
         } else {
             output.push(path);
         }
@@ -1712,6 +1792,7 @@ pub fn sync_document_dependencies_from_snarl(
 pub fn apply_inspector_node_change(
     project: &mut EditorProjectState,
     node_id: NodeId,
+    name: Option<String>,
     kind: Option<NodeKind>,
     target: Option<NodeExecutionTarget>,
     fallback: Option<NodeFallbackPolicy>,
@@ -1732,6 +1813,16 @@ pub fn apply_inspector_node_change(
     };
 
     let mut commands = Vec::new();
+
+    if let Some(name_new) = name {
+        if name_new != node.name {
+            commands.push(EditorCommand::SetNodeName {
+                node_id,
+                old_name: node.name.clone(),
+                new_name: name_new,
+            });
+        }
+    }
 
     if let Some(kind_new) = kind {
         if kind_new != node.kind {
@@ -1791,6 +1882,225 @@ pub fn apply_inspector_node_change(
     }
 
     project.apply_command_batch("inspector_change", commands)
+}
+
+pub fn sync_node_payload_from_settings(node: &mut Node) {
+    match node.kind {
+        NodeKind::GameplayEvent => {
+            let mut payload = node
+                .payload
+                .as_ref()
+                .and_then(|payload| match payload {
+                    NodePayload::GameplayEvent(payload) => Some(payload.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            if let Some(value) = node.settings.get("event_name") {
+                payload.event_name = value.clone();
+            }
+            node.payload = Some(NodePayload::GameplayEvent(payload));
+        }
+        NodeKind::GameplayFlow => {
+            let mut payload = node
+                .payload
+                .as_ref()
+                .and_then(|payload| match payload {
+                    NodePayload::GameplayFlow(payload) => Some(payload.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            if let Some(value) = node.settings.get("condition_key") {
+                payload.condition_key = value.clone();
+            }
+            if let Some(value) = node.settings.get("expected_value") {
+                payload.expected_value = value.clone();
+            }
+            node.payload = Some(NodePayload::GameplayFlow(payload));
+        }
+        NodeKind::MathState => {
+            let mut payload = node
+                .payload
+                .as_ref()
+                .and_then(|payload| match payload {
+                    NodePayload::MathState(payload) => Some(payload.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            if let Some(value) = node.settings.get("operation") {
+                payload.operation = value.clone();
+            }
+            payload.lhs = parse_f32_setting(node.settings.get("lhs"), payload.lhs);
+            payload.rhs = parse_f32_setting(node.settings.get("rhs"), payload.rhs);
+            if let Some(value) = node.settings.get("output_key") {
+                payload.output_key = value.clone();
+            }
+            node.payload = Some(NodePayload::MathState(payload));
+        }
+        NodeKind::ObjectInitializer => {
+            let mut payload = node
+                .payload
+                .as_ref()
+                .and_then(|payload| match payload {
+                    NodePayload::ObjectInitializer(payload) => Some(payload.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            if let Some(value) = node.settings.get("object_name") {
+                payload.object_name = value.clone();
+            }
+            payload.layer_id = parse_u64_setting(node.settings.get("layer_id"), payload.layer_id);
+            payload.x = parse_f32_setting(node.settings.get("x"), payload.x);
+            payload.y = parse_f32_setting(node.settings.get("y"), payload.y);
+            node.payload = Some(NodePayload::ObjectInitializer(payload));
+        }
+        NodeKind::ScriptBehavior => {
+            let mut payload = node
+                .payload
+                .as_ref()
+                .and_then(|payload| match payload {
+                    NodePayload::ScriptBehavior(payload) => Some(payload.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            if let Some(value) = node.settings.get("script_asset") {
+                payload.script_asset = value.clone();
+            }
+            if let Some(value) = node.settings.get("script_entry") {
+                payload.entry = value.clone();
+            }
+            if let Some(value) = node.settings.get("script_phase") {
+                payload.frame_phase = value.clone();
+            }
+            node.payload = Some(NodePayload::ScriptBehavior(payload));
+        }
+        NodeKind::RenderPass => {
+            let mut payload = node
+                .payload
+                .as_ref()
+                .and_then(|payload| match payload {
+                    NodePayload::RenderPass(payload) => Some(payload.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            if let Some(value) = node.settings.get("target_resource") {
+                payload.target_resource = value.clone();
+            }
+            payload.target_width =
+                parse_u32_setting(node.settings.get("target_width"), payload.target_width);
+            payload.target_height =
+                parse_u32_setting(node.settings.get("target_height"), payload.target_height);
+            payload.sprite_count =
+                parse_u32_setting(node.settings.get("sprite_count"), payload.sprite_count);
+            if let Some(value) = node.settings.get("blend") {
+                payload.blend = value.clone();
+            }
+            node.payload = Some(NodePayload::RenderPass(payload));
+        }
+        NodeKind::ComputePass => {
+            let mut payload = node
+                .payload
+                .as_ref()
+                .and_then(|payload| match payload {
+                    NodePayload::ComputePass(payload) => Some(payload.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            if let Some(value) = node.settings.get("shader") {
+                payload.shader = value.clone();
+            }
+            let dispatch_x = parse_u32_setting(node.settings.get("dispatch_x"), payload.dispatch[0]);
+            let dispatch_y = parse_u32_setting(node.settings.get("dispatch_y"), payload.dispatch[1]);
+            let dispatch_z = parse_u32_setting(node.settings.get("dispatch_z"), payload.dispatch[2]);
+            payload.dispatch = [dispatch_x, dispatch_y, dispatch_z];
+            payload.reads = parse_csv_setting(node.settings.get("read_resources"));
+            payload.writes = parse_csv_setting(node.settings.get("write_resources"));
+            node.compute = Some(ComputeDispatchConfig {
+                x: dispatch_x,
+                y: dispatch_y,
+                z: dispatch_z,
+            });
+            node.payload = Some(NodePayload::ComputePass(payload));
+        }
+        NodeKind::AssetReference => {
+            let mut payload = node
+                .payload
+                .as_ref()
+                .and_then(|payload| match payload {
+                    NodePayload::AssetReference(payload) => Some(payload.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            if let Some(value) = node.settings.get("asset_path") {
+                payload.asset_path = value.clone();
+            }
+            if let Some(value) = node.settings.get("asset_kind") {
+                payload.asset_kind = value.clone();
+            }
+            node.payload = Some(NodePayload::AssetReference(payload));
+        }
+        NodeKind::BuildExport => {
+            let mut payload = node
+                .payload
+                .as_ref()
+                .and_then(|payload| match payload {
+                    NodePayload::BuildExport(payload) => Some(payload.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            if let Some(value) = node.settings.get("target") {
+                payload.target = value.clone();
+            }
+            node.payload = Some(NodePayload::BuildExport(payload));
+        }
+        NodeKind::Custom => {
+            let mut payload = node
+                .payload
+                .as_ref()
+                .and_then(|payload| match payload {
+                    NodePayload::Custom(payload) => Some(payload.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            if let Some(value) = node.settings.get("config_path") {
+                payload.config_path = value.clone();
+            }
+            if let Some(value) = node.settings.get("impl_path") {
+                payload.impl_path = Some(value.clone());
+            }
+            node.payload = Some(NodePayload::Custom(payload));
+        }
+    }
+}
+
+fn parse_u32_setting(value: Option<&String>, fallback: u32) -> u32 {
+    value
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .unwrap_or(fallback)
+}
+
+fn parse_u64_setting(value: Option<&String>, fallback: u64) -> u64 {
+    value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(fallback)
+}
+
+fn parse_f32_setting(value: Option<&String>, fallback: f32) -> f32 {
+    value
+        .and_then(|value| value.trim().parse::<f32>().ok())
+        .unwrap_or(fallback)
+}
+
+fn parse_csv_setting(value: Option<&String>) -> Vec<String> {
+    value
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
 }
 
 pub fn draw_overlay(
@@ -2120,5 +2430,94 @@ mod tests {
         )
         .expect_err("cycle should fail");
         assert!(matches!(cycle_err, EditorError::Command(_)));
+    }
+
+    #[test]
+    fn node_dependency_cycle_is_rejected() {
+        let mut document = EditorDocument::from_graph(NodeGraph {
+            version: CURRENT_GRAPH_VERSION,
+            nodes: vec![
+                sample_node(1, NodeKind::GameplayEvent),
+                sample_node(2, NodeKind::GameplayEvent),
+            ],
+        });
+
+        apply_command_internal(
+            &mut document,
+            &EditorCommand::ConnectNodes { from: 1, to: 2 },
+        )
+        .expect("connection should apply");
+
+        let err = apply_command_internal(
+            &mut document,
+            &EditorCommand::ConnectNodes { from: 2, to: 1 },
+        )
+        .expect_err("cycle should fail");
+        assert!(matches!(err, EditorError::Command(_)));
+    }
+
+    #[test]
+    fn node_rename_command_roundtrips_through_history() {
+        let document = EditorDocument::from_graph(NodeGraph {
+            version: CURRENT_GRAPH_VERSION,
+            nodes: vec![sample_node(1, NodeKind::GameplayEvent)],
+        });
+        let mut history = HistoryGraph::new(document.clone());
+
+        let mut changed = document.clone();
+        let command = EditorCommand::SetNodeName {
+            node_id: 1,
+            old_name: "node_1".to_string(),
+            new_name: "renamed".to_string(),
+        };
+        apply_command_internal(&mut changed, &command).expect("rename should apply");
+        let id = history.record("rename", command, changed);
+
+        assert!(history.replay_matches_snapshot(id));
+        let replayed = history.undo().expect("undo should produce document");
+        assert_eq!(replayed.scene.graph.nodes[0].name, "node_1");
+    }
+
+    #[test]
+    fn set_node_kind_syncs_payload_from_settings() {
+        let mut document = EditorDocument::from_graph(NodeGraph {
+            version: CURRENT_GRAPH_VERSION,
+            nodes: vec![Node {
+                id: 1,
+                name: "script".to_string(),
+                kind: NodeKind::ScriptBehavior,
+                target: NodeExecutionTarget::Cpu,
+                dependencies: vec![],
+                settings: BTreeMap::from([
+                    ("script_asset".to_string(), "assets/foo.rhai".to_string()),
+                    ("script_entry".to_string(), "tick".to_string()),
+                    ("script_phase".to_string(), "gameplay".to_string()),
+                ]),
+                gpu_bindings: vec![],
+                compute: None,
+                fallback_policy: NodeFallbackPolicy::Cpu,
+                gpu_resource_states: vec![],
+                shader_entry: None,
+                shader_profile: None,
+                payload: Some(NodePayload::ScriptBehavior(ScriptBehaviorPayload::default())),
+            }],
+        });
+
+        apply_command_internal(
+            &mut document,
+            &EditorCommand::SetNodeKind {
+                node_id: 1,
+                old: NodeKind::ScriptBehavior,
+                new: NodeKind::Custom,
+            },
+        )
+        .expect("kind change should apply");
+
+        assert_eq!(document.scene.graph.nodes[0].kind, NodeKind::Custom);
+        let payload = document.scene.graph.nodes[0]
+            .payload
+            .as_ref()
+            .expect("payload should be present");
+        assert!(matches!(payload, NodePayload::Custom(_)));
     }
 }

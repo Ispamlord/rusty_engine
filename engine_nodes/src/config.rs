@@ -251,49 +251,49 @@ fn parse_predefined_node_type(value: &str) -> Option<PredefinedNodeType> {
 
 #[cfg(test)]
 mod tests {
-        use super::*;
+    use super::*;
 
-        #[test]
-        fn parses_map_style_type_descriptor() {
-                let yaml = r#"
+    #[test]
+    fn parses_map_style_type_descriptor() {
+        let yaml = r#"
 version: 1
 type_name: ExampleNode
 display_name: Example Node
 inputs:
     - name: value
-        type: { Predefined: F32 }
+      type: { Predefined: F32 }
 outputs:
     - name: result
-        type: { Predefined: F32 }
+      type: { Predefined: F32 }
 "#;
 
-                let config = parse_node_config(yaml).expect("config should parse");
-                assert_eq!(config.inputs.len(), 1);
-                assert!(matches!(
-                        config.inputs[0].type_descriptor,
-                        NodeTypeDescriptor::Predefined(PredefinedNodeType::F32)
-                ));
-        }
+        let config = parse_node_config(yaml).expect("config should parse");
+        assert_eq!(config.inputs.len(), 1);
+        assert!(matches!(
+            config.inputs[0].type_descriptor,
+            NodeTypeDescriptor::Predefined(PredefinedNodeType::F32)
+        ));
+    }
 
-        #[test]
-        fn parses_scalar_predefined_type_descriptor() {
-                let yaml = r#"
+    #[test]
+    fn parses_scalar_predefined_type_descriptor() {
+        let yaml = r#"
 version: 1
 type_name: ExampleNode
 display_name: Example Node
 inputs:
     - name: value
-        type: F32
+      type: F32
 outputs:
     - name: result
-        type: F32
+      type: F32
 "#;
 
-                let config = parse_node_config(yaml).expect("config should parse");
-                assert_eq!(config.outputs.len(), 1);
-                assert!(matches!(
-                        config.outputs[0].type_descriptor,
-                        NodeTypeDescriptor::Predefined(PredefinedNodeType::F32)
-                ));
-        }
+        let config = parse_node_config(yaml).expect("config should parse");
+        assert_eq!(config.outputs.len(), 1);
+        assert!(matches!(
+            config.outputs[0].type_descriptor,
+            NodeTypeDescriptor::Predefined(PredefinedNodeType::F32)
+        ));
+    }
 }

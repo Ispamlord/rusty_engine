@@ -1,15 +1,69 @@
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::time::Instant;
+
+mod renderer;
 
 use ash::vk;
 use ash_window::create_surface as create_vulkan_surface;
 use engine_core::EngineConfig;
 use engine_render_api::{
     BackendCapabilities, BackendDiagnosticEvent, BackendDiagnosticLevel, BackendDiagnostics,
-    BackendError, BackendKind, BackendPassTiming, FrameToken, GraphicsBackend, RenderGraph,
-    RenderGraphPass, RenderTargetDescriptor, RenderTargetHandle, SurfaceConfig, SurfaceHandle,
-    SurfaceWindowHandles, TextureDescriptor, TextureHandle, ViewportReadback,
+    BackendError, BackendInstrumentationState, BackendKind, BackendPassTiming, FrameCaptureHandle,
+    FrameCaptureRequest, FrameCaptureResult, FrameToken, GraphResourceKind,
+    GpuInstrumentationConfig, GraphicsBackend, RenderGraph, RenderGraphPass, RenderTargetDescriptor,
+    RenderTargetHandle, SurfaceConfig, SurfaceHandle, SurfaceWindowHandles, TextureDescriptor,
+    TextureHandle, ViewportReadback,
 };
+use renderer::VulkanRenderer;
+
+#[cfg(test)]
+use engine_render_api::FrameCaptureFormat;
+
+pub(crate) struct VulkanTexture {
+    pub image: vk::Image,
+    pub memory: vk::DeviceMemory,
+    pub view: vk::ImageView,
+    pub sampler: vk::Sampler,
+}
+
+impl VulkanTexture {
+    pub(crate) unsafe fn destroy(&self, device: &ash::Device) {
+        device.destroy_sampler(self.sampler, None);
+        device.destroy_image_view(self.view, None);
+        device.destroy_image(self.image, None);
+        device.free_memory(self.memory, None);
+    }
+}
+
+pub(crate) struct VulkanRenderTarget {
+    pub image: vk::Image,
+    pub memory: vk::DeviceMemory,
+    pub view: vk::ImageView,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl VulkanRenderTarget {
+    pub(crate) unsafe fn destroy(&self, device: &ash::Device) {
+        device.destroy_image_view(self.view, None);
+        device.destroy_image(self.image, None);
+        device.free_memory(self.memory, None);
+    }
+}
+
+pub(crate) struct VulkanStorageBuffer {
+    pub buffer: vk::Buffer,
+    pub memory: vk::DeviceMemory,
+    pub size: vk::DeviceSize,
+}
+
+impl VulkanStorageBuffer {
+    pub(crate) unsafe fn destroy(&self, device: &ash::Device) {
+        device.destroy_buffer(self.buffer, None);
+        device.free_memory(self.memory, None);
+    }
+}
 
 struct VulkanSurfaceState {
     surface_loader: ash::khr::surface::Instance,
@@ -33,6 +87,7 @@ pub struct VulkanBackend {
     frame_in_flight: Option<FrameToken>,
     frame_start: Option<Instant>,
     diagnostics: BackendDiagnostics,
+    instrumentation: BackendInstrumentationState,
 
     entry: Option<ash::Entry>,
     instance: Option<ash::Instance>,
@@ -45,6 +100,10 @@ pub struct VulkanBackend {
     submit_fence: Option<vk::Fence>,
     surface_state: Option<VulkanSurfaceState>,
     surface_window_handles: Option<SurfaceWindowHandles>,
+    renderer: Option<VulkanRenderer>,
+    textures: HashMap<TextureHandle, VulkanTexture>,
+    render_targets: HashMap<RenderTargetHandle, VulkanRenderTarget>,
+    storage_buffers: HashMap<String, VulkanStorageBuffer>,
     last_recorded_graph: Option<RenderGraph>,
     last_viewport_readback: Option<ViewportReadback>,
 }
@@ -66,6 +125,7 @@ impl VulkanBackend {
             frame_in_flight: None,
             frame_start: None,
             diagnostics: BackendDiagnostics::new(BackendKind::Vulkan),
+            instrumentation: BackendInstrumentationState::default(),
             entry: None,
             instance: None,
             physical_device: None,
@@ -77,6 +137,10 @@ impl VulkanBackend {
             submit_fence: None,
             surface_state: None,
             surface_window_handles: None,
+            renderer: None,
+            textures: HashMap::new(),
+            render_targets: HashMap::new(),
+            storage_buffers: HashMap::new(),
             last_recorded_graph: None,
             last_viewport_readback: None,
         }
@@ -92,6 +156,41 @@ impl VulkanBackend {
         let token = FrameToken(self.next_frame);
         self.next_frame += 1;
         token
+    }
+
+    fn ensure_graph_resources(
+        &mut self,
+        graph: &RenderGraph,
+    ) -> Result<(), BackendError> {
+        let device = self.device_ref()?.clone();
+        let physical_device = self.physical_device.ok_or_else(|| {
+            BackendError::Runtime("vulkan physical device missing".to_string())
+        })?;
+        let instance = self.instance.as_ref().ok_or_else(|| {
+            BackendError::Runtime("vulkan instance missing".to_string())
+        })?;
+
+        for resource in &graph.resources {
+            let GraphResourceKind::StorageBuffer { size_bytes } = resource.kind else {
+                continue;
+            };
+            if self.storage_buffers.contains_key(&resource.name) {
+                continue;
+            }
+            let size = size_bytes as vk::DeviceSize;
+            let (buffer, memory) =
+                renderer::create_storage_buffer(&device, physical_device, instance, size)?;
+            self.storage_buffers.insert(
+                resource.name.clone(),
+                VulkanStorageBuffer {
+                    buffer,
+                    memory,
+                    size,
+                },
+            );
+        }
+
+        Ok(())
     }
 
     fn record_event(
@@ -148,6 +247,30 @@ impl VulkanBackend {
             device
                 .device_wait_idle()
                 .map_err(|err| BackendError::Runtime(format!("vkDeviceWaitIdle failed: {err}")))?;
+        }
+
+        if let Some(device) = self.device.clone() {
+            if let Some(mut renderer) = self.renderer.take() {
+                renderer.destroy(&device);
+            }
+        }
+
+        for (_handle, texture) in self.textures.drain() {
+            unsafe {
+                texture.destroy(device);
+            }
+        }
+
+        for (_handle, target) in self.render_targets.drain() {
+            unsafe {
+                target.destroy(device);
+            }
+        }
+
+        for (_name, buffer) in self.storage_buffers.drain() {
+            unsafe {
+                buffer.destroy(device);
+            }
         }
 
         if let Some(fence) = self.submit_fence.take() {
@@ -249,10 +372,12 @@ impl VulkanBackend {
             vk::Extent2D {
                 width: width
                     .max(capabilities.min_image_extent.width)
-                    .min(capabilities.max_image_extent.width),
+                    .min(capabilities.max_image_extent.width)
+                    .max(1),
                 height: height
                     .max(capabilities.min_image_extent.height)
-                    .min(capabilities.max_image_extent.height),
+                    .min(capabilities.max_image_extent.height)
+                    .max(1),
             }
         }
     }
@@ -268,9 +393,12 @@ impl VulkanBackend {
             .ok_or_else(|| BackendError::Runtime("vulkan entry missing".to_string()))?;
         let instance = self
             .instance
-            .as_ref()
+            .clone()
             .ok_or_else(|| BackendError::Runtime("vulkan instance missing".to_string()))?;
-        let device = self.device_ref()?;
+        let device = self
+            .device
+            .clone()
+            .ok_or_else(|| BackendError::Runtime("vulkan device missing".to_string()))?;
         let physical_device = self
             .physical_device
             .ok_or_else(|| BackendError::Runtime("physical device missing".to_string()))?;
@@ -278,11 +406,11 @@ impl VulkanBackend {
             .queue_family_index
             .ok_or_else(|| BackendError::Runtime("queue family index missing".to_string()))?;
 
-        let surface_loader = ash::khr::surface::Instance::new(entry, instance);
+        let surface_loader = ash::khr::surface::Instance::new(entry, &instance);
         let surface = unsafe {
             create_vulkan_surface(
                 entry,
-                instance,
+                &instance,
                 window.display_handle,
                 window.window_handle,
                 None,
@@ -349,7 +477,7 @@ impl VulkanBackend {
             image_count = image_count.min(capabilities.max_image_count);
         }
 
-        let swapchain_loader = ash::khr::swapchain::Device::new(instance, device);
+        let swapchain_loader = ash::khr::swapchain::Device::new(&instance, &device);
         let swapchain_info = vk::SwapchainCreateInfoKHR::default()
             .surface(surface)
             .min_image_count(image_count)
@@ -395,6 +523,27 @@ impl VulkanBackend {
                     BackendError::Surface(format!("create render semaphore failed: {err}"))
                 })?
         };
+
+        let command_pool = self.command_pool.ok_or_else(|| {
+            BackendError::Runtime("command pool missing during surface creation".to_string())
+        })?;
+        let queue = self.queue_ref()?;
+
+        if self.renderer.is_none() {
+            self.renderer = Some(VulkanRenderer::new(
+                &device,
+                physical_device,
+                &instance,
+                format,
+                command_pool,
+                queue_family_index,
+                queue,
+            )?);
+        }
+
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.ensure_swapchain_views(&device, &images, extent)?;
+        }
 
         Ok(VulkanSurfaceState {
             surface_loader,
@@ -491,7 +640,8 @@ impl VulkanBackend {
         let config = self.surface_config?;
         let width = config.width.max(1);
         let height = config.height.max(1);
-        let mut rgba = vec![0_u8; width as usize * height as usize * 4];
+        let buffer_size = ViewportReadback::buffer_size(width, height)?;
+        let mut rgba = vec![0_u8; buffer_size];
         for y in 0..height {
             for x in 0..width {
                 let idx = ((y * width + x) * 4) as usize;
@@ -698,6 +848,66 @@ impl GraphicsBackend for VulkanBackend {
         Ok(())
     }
 
+    fn preload_shader_bytecode(
+        &mut self,
+        name: &str,
+        entry_point: &str,
+        bytecode: &[u8],
+    ) -> Result<(), BackendError> {
+        if !self.initialized {
+            return Err(BackendError::Runtime(
+                "vulkan backend not initialized".to_string(),
+            ));
+        }
+
+        if self.renderer.is_none() {
+            let device = self.device_ref()?.clone();
+            let physical_device = self.physical_device.ok_or_else(|| {
+                BackendError::Runtime("physical device missing".to_string())
+            })?;
+            let instance = self
+                .instance
+                .as_ref()
+                .ok_or_else(|| BackendError::Runtime("vulkan instance missing".to_string()))?
+                .clone();
+            let command_pool = self.command_pool.ok_or_else(|| {
+                BackendError::Runtime("command pool missing".to_string())
+            })?;
+            let queue_family_index = self.queue_family_index.ok_or_else(|| {
+                BackendError::Runtime("queue family index missing".to_string())
+            })?;
+            let queue = self.queue_ref()?;
+
+            // No surface format is known yet; use a sensible default.  The
+            // renderer will be reused when the surface is created.
+            let default_format = vk::SurfaceFormatKHR {
+                format: vk::Format::B8G8R8A8_UNORM,
+                color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR,
+            };
+
+            self.renderer = Some(VulkanRenderer::new(
+                &device,
+                physical_device,
+                &instance,
+                default_format,
+                command_pool,
+                queue_family_index,
+                queue,
+            )?);
+        }
+
+        let device = self.device_ref()?.clone();
+
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.load_shader_module(&device, name, bytecode)?;
+            renderer
+                .shader_entry_points
+                .insert(name.to_string(), entry_point.to_string());
+        }
+
+        Ok(())
+    }
+
     fn create_surface(
         &mut self,
         config: SurfaceConfig,
@@ -770,6 +980,12 @@ impl GraphicsBackend for VulkanBackend {
             return Err(BackendError::Surface("unknown surface handle".to_string()));
         }
 
+        if width == 0 || height == 0 {
+            return Err(BackendError::Surface(
+                "resize dimensions must be greater than zero".to_string(),
+            ));
+        }
+
         if let Some(config) = &mut self.surface_config {
             config.width = width;
             config.height = height;
@@ -822,7 +1038,7 @@ impl GraphicsBackend for VulkanBackend {
 
     fn create_texture(
         &mut self,
-        _descriptor: TextureDescriptor,
+        descriptor: TextureDescriptor,
     ) -> Result<TextureHandle, BackendError> {
         if !self.initialized {
             return Err(BackendError::Runtime(
@@ -830,12 +1046,41 @@ impl GraphicsBackend for VulkanBackend {
             ));
         }
 
-        Ok(TextureHandle(self.allocate_handle()))
+        let handle = TextureHandle(self.allocate_handle());
+
+        let device = self.device_ref()?;
+        let physical_device = self.physical_device.ok_or_else(|| {
+            BackendError::Runtime("vulkan physical device missing".to_string())
+        })?;
+        let instance = self.instance.as_ref().ok_or_else(|| {
+            BackendError::Runtime("vulkan instance missing".to_string())
+        })?;
+        let queue_family_index = self.queue_family_index.ok_or_else(|| {
+            BackendError::Runtime("vulkan queue family missing".to_string())
+        })?;
+        let command_pool = self.command_pool.ok_or_else(|| {
+            BackendError::Runtime("vulkan command pool missing".to_string())
+        })?;
+        let queue = self.queue_ref()?;
+
+        let texture = renderer::create_texture_image(
+            device,
+            physical_device,
+            instance,
+            queue_family_index,
+            command_pool,
+            queue,
+            descriptor.width,
+            descriptor.height,
+            None,
+        )?;
+        self.textures.insert(handle, texture);
+        Ok(handle)
     }
 
     fn create_render_target(
         &mut self,
-        _descriptor: RenderTargetDescriptor,
+        descriptor: RenderTargetDescriptor,
     ) -> Result<RenderTargetHandle, BackendError> {
         if !self.initialized {
             return Err(BackendError::Runtime(
@@ -843,7 +1088,29 @@ impl GraphicsBackend for VulkanBackend {
             ));
         }
 
-        Ok(RenderTargetHandle(self.allocate_handle()))
+        let handle = RenderTargetHandle(self.allocate_handle());
+
+        let device = self.device_ref()?;
+        let physical_device = self.physical_device.ok_or_else(|| {
+            BackendError::Runtime("vulkan physical device missing".to_string())
+        })?;
+        let instance = self.instance.as_ref().ok_or_else(|| {
+            BackendError::Runtime("vulkan instance missing".to_string())
+        })?;
+        let queue_family_index = self.queue_family_index.ok_or_else(|| {
+            BackendError::Runtime("vulkan queue family missing".to_string())
+        })?;
+
+        let target = renderer::create_render_target_image(
+            device,
+            physical_device,
+            instance,
+            queue_family_index,
+            descriptor.width,
+            descriptor.height,
+        )?;
+        self.render_targets.insert(handle, target);
+        Ok(handle)
     }
 
     fn acquire_frame(&mut self, surface: SurfaceHandle) -> Result<FrameToken, BackendError> {
@@ -869,12 +1136,21 @@ impl GraphicsBackend for VulkanBackend {
 
         {
             let device = self.device_ref()?;
+            const FRAME_FENCE_TIMEOUT_NS: u64 = 5_000_000_000;
             unsafe {
-                device
-                    .wait_for_fences(&[fence], true, u64::MAX)
-                    .map_err(|err| {
-                        BackendError::Runtime(format!("vkWaitForFences failed: {err}"))
-                    })?;
+                match device.wait_for_fences(&[fence], true, FRAME_FENCE_TIMEOUT_NS) {
+                    Ok(()) => {}
+                    Err(vk::Result::TIMEOUT) => {
+                        return Err(BackendError::DeviceLost(
+                            "waiting for frame fence timed out".to_string(),
+                        ));
+                    }
+                    Err(err) => {
+                        return Err(BackendError::Runtime(format!(
+                            "vkWaitForFences failed: {err}"
+                        )));
+                    }
+                }
                 device
                     .reset_fences(&[fence])
                     .map_err(|err| BackendError::Runtime(format!("vkResetFences failed: {err}")))?;
@@ -956,26 +1232,37 @@ impl GraphicsBackend for VulkanBackend {
             ));
         }
 
+        self.ensure_graph_resources(graph)?;
+
         for pass in &graph.passes {
             let pass_start = Instant::now();
             let (label, detail) = match pass {
                 RenderGraphPass::Render(node) => {
                     let sprite_count: usize =
                         node.batches.iter().map(|batch| batch.sprites.len()).sum();
+                    let shader = node
+                        .material
+                        .as_ref()
+                        .map(|m| m.shader_asset.as_str())
+                        .unwrap_or("builtin");
                     (
                         node.label.clone(),
                         format!(
-                            "render pass with {} batches and {} sprites",
+                            "render pass with {} batches and {} sprites (shader {})",
                             node.batches.len(),
-                            sprite_count
+                            sprite_count,
+                            shader
                         ),
                     )
                 }
                 RenderGraphPass::Compute(node) => (
                     node.label.clone(),
                     format!(
-                        "compute dispatch {}x{}x{}",
-                        node.dispatch[0], node.dispatch[1], node.dispatch[2]
+                        "compute dispatch {}x{}x{} (shader {})",
+                        node.dispatch[0],
+                        node.dispatch[1],
+                        node.dispatch[2],
+                        node.material.shader_asset
                     ),
                 ),
             };
@@ -993,6 +1280,32 @@ impl GraphicsBackend for VulkanBackend {
                 cpu_ms,
                 gpu_ms: None,
             });
+        }
+
+        let command_buffer = self.command_buffer_ref()?;
+        let device = self
+            .device
+            .clone()
+            .ok_or_else(|| BackendError::Runtime("vulkan device missing".to_string()))?;
+        let surface_info = self
+            .surface_state
+            .as_ref()
+            .and_then(|s| s.acquired_image_index.map(|i| (i, s.extent)));
+
+        if let Some(renderer) = self.renderer.as_mut() {
+            if let Some((image_index, extent)) = surface_info {
+                renderer.record_render_graph(
+                    &device,
+                    command_buffer,
+                    graph,
+                    &self.textures,
+                    &self.render_targets,
+                    &self.storage_buffers,
+                    image_index,
+                    extent,
+                    [0.04, 0.09, 0.08, 1.0],
+                )?;
+            }
         }
 
         self.last_recorded_graph = Some(graph.clone());
@@ -1120,6 +1433,47 @@ impl GraphicsBackend for VulkanBackend {
     fn destroy(&mut self) -> Result<(), BackendError> {
         self.destroy_internal()
     }
+
+    fn set_gpu_timestamps_enabled(&mut self, enabled: bool) {
+        self.instrumentation.set_gpu_timestamps_enabled(enabled);
+        self.diagnostics.gpu_timestamps_enabled = enabled;
+    }
+
+    fn configure_gpu_instrumentation(
+        &mut self,
+        config: GpuInstrumentationConfig,
+    ) {
+        self.instrumentation.configure(config);
+        self.diagnostics.gpu_timestamps_enabled = config.enabled;
+    }
+
+    fn request_frame_capture(
+        &mut self,
+        request: FrameCaptureRequest,
+    ) -> Result<FrameCaptureHandle, BackendError> {
+        let handle = self.instrumentation.request_capture(request);
+        self.diagnostics.frame_captures_pending =
+            self.instrumentation.pending_captures.len() as u64;
+        Ok(handle)
+    }
+
+    fn poll_frame_capture(
+        &mut self,
+        handle: FrameCaptureHandle,
+    ) -> Result<FrameCaptureResult, BackendError> {
+        if let Some(result) = self.instrumentation.poll_capture(handle) {
+            self.diagnostics.frame_captures_pending =
+                self.instrumentation.pending_captures.len() as u64;
+            self.diagnostics.frame_captures_completed =
+                self.instrumentation.completed_captures.len() as u64;
+            Ok(result)
+        } else {
+            Err(BackendError::Runtime(format!(
+                "frame capture handle {:?} not found",
+                handle
+            )))
+        }
+    }
 }
 
 impl Drop for VulkanBackend {
@@ -1127,5 +1481,77 @@ impl Drop for VulkanBackend {
         if let Err(err) = self.destroy_internal() {
             tracing::warn!("vulkan backend drop cleanup failed: {err}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kind_is_vulkan() {
+        let backend = VulkanBackend::new();
+        assert_eq!(backend.kind(), BackendKind::Vulkan);
+    }
+
+    #[test]
+    fn capabilities_claim_viewport_readback() {
+        let backend = VulkanBackend::new();
+        assert!(backend.capabilities().viewport_readback);
+        assert!(backend.capabilities().compute_nodes);
+    }
+
+    #[test]
+    fn diagnostics_new_has_zero_counts() {
+        let backend = VulkanBackend::new();
+        let diag = backend.diagnostics();
+        assert_eq!(diag.backend, BackendKind::Vulkan);
+        assert!(!diag.supports_surface);
+        assert_eq!(diag.fallback_events, 0);
+        assert_eq!(diag.swapchain_recreates, 0);
+        assert_eq!(diag.device_loss_events, 0);
+        assert!(!diag.gpu_timestamps_enabled);
+        assert_eq!(diag.frame_captures_pending, 0);
+        assert_eq!(diag.frame_captures_completed, 0);
+        assert!(diag.events.is_empty());
+        assert!(diag.pass_timings.is_empty());
+    }
+
+    #[test]
+    fn frame_capture_request_and_poll() {
+        let mut backend = VulkanBackend::new();
+        let handle = backend
+            .request_frame_capture(FrameCaptureRequest {
+                label: "test".into(),
+                format: FrameCaptureFormat::Rgba8,
+            })
+            .expect("request should succeed");
+        assert_eq!(backend.diagnostics().frame_captures_pending, 1);
+
+        let in_flight = backend
+            .poll_frame_capture(handle)
+            .expect("poll should return in-flight marker");
+        assert!(!in_flight.completed);
+
+        backend.instrumentation.complete_oldest_capture(2, 2, vec![0; 16]);
+        let completed = backend
+            .poll_frame_capture(handle)
+            .expect("poll should return completed capture");
+        assert!(completed.completed);
+        assert_eq!(completed.data, Some(vec![0; 16]));
+        assert_eq!(completed.width, 2);
+        assert_eq!(completed.height, 2);
+    }
+
+    #[test]
+    fn gpu_timestamps_enable_updates_diagnostics() {
+        let mut backend = VulkanBackend::new();
+        backend.set_gpu_timestamps_enabled(true);
+        assert!(backend.diagnostics().gpu_timestamps_enabled);
+        backend.configure_gpu_instrumentation(GpuInstrumentationConfig {
+            enabled: false,
+            timestamp_query_period: 0,
+        });
+        assert!(!backend.diagnostics().gpu_timestamps_enabled);
     }
 }
