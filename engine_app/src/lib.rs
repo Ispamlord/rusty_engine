@@ -78,13 +78,68 @@ struct GraphRuntimeState {
 #[derive(Resource, Default)]
 struct FrameCounter(pub u64);
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 struct RuntimeInputState {
     left: bool,
     right: bool,
     up: bool,
     down: bool,
+    mouse_x: f32,
+    mouse_y: f32,
+    mouse_left: bool,
+    mouse_right: bool,
+    mouse_middle: bool,
 }
+
+#[derive(Debug, Clone, Copy)]
+struct UiCommand {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    r: u8,
+    g: u8,
+    b: u8,
+    a: u8,
+}
+
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+enum UiCommandKind {
+    Rect,
+    Text,
+}
+
+impl UiCommand {
+    fn rect(x: f32, y: f32, width: f32, height: f32, color: [u8; 4]) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            height,
+            r: color[0],
+            g: color[1],
+            b: color[2],
+            a: color[3],
+        }
+    }
+
+    fn text(x: f32, y: f32, size: f32, color: [u8; 4]) -> Self {
+        // Text is rendered as a small colored rectangle placeholder until a
+        // real font atlas is available.
+        Self {
+            x,
+            y,
+            width: size * 4.0,
+            height: size,
+            r: color[0],
+            g: color[1],
+            b: color[2],
+            a: color[3],
+        }
+    }
+}
+
 
 #[derive(Debug, Clone, Copy)]
 struct ViewportReadbackBalancer {
@@ -136,10 +191,23 @@ impl RuntimeInputState {
             "right" | "d" | "arrowright" => self.right,
             "up" | "w" | "arrowup" => self.up,
             "down" | "s" | "arrowdown" => self.down,
+            "mouse_left" | "mouseleft" | "lmb" => self.mouse_left,
+            "mouse_right" | "mouseright" | "rmb" => self.mouse_right,
+            "mouse_middle" | "mousemiddle" | "mmb" => self.mouse_middle,
+            _ => false,
+        }
+    }
+
+    fn mouse_down(self, button: &str) -> bool {
+        match button.trim().to_ascii_lowercase().as_str() {
+            "left" | "lmb" => self.mouse_left,
+            "right" | "rmb" => self.mouse_right,
+            "middle" | "mmb" => self.mouse_middle,
             _ => false,
         }
     }
 }
+
 
 #[derive(Debug, Clone, Default)]
 struct ScriptHostState {
@@ -148,6 +216,7 @@ struct ScriptHostState {
     logs: Vec<String>,
     next_object_id: u64,
     input: RuntimeInputState,
+    ui_commands: Vec<UiCommand>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -223,6 +292,14 @@ impl ScriptHostState {
                 update(object);
             }
         }
+    }
+
+    fn push_ui_command(&mut self, command: UiCommand) {
+        self.ui_commands.push(command);
+    }
+
+    fn drain_ui_commands(&mut self) -> Vec<UiCommand> {
+        std::mem::take(&mut self.ui_commands)
     }
 }
 
@@ -481,6 +558,36 @@ fn create_rhai_engine(host_state: Arc<Mutex<ScriptHostState>>) -> RhaiEngine {
 
     {
         let host = host_state.clone();
+        engine.register_fn("get_transform_x", move |id: i64| -> f64 {
+            let Ok(state) = host.lock() else {
+                return 0.0;
+            };
+            state
+                .scene
+                .as_ref()
+                .and_then(|scene| scene.objects.iter().find(|object| object.object_id == id as u64))
+                .map(|object| object.components.transform.x as f64)
+                .unwrap_or(0.0)
+        });
+    }
+
+    {
+        let host = host_state.clone();
+        engine.register_fn("get_transform_y", move |id: i64| -> f64 {
+            let Ok(state) = host.lock() else {
+                return 0.0;
+            };
+            state
+                .scene
+                .as_ref()
+                .and_then(|scene| scene.objects.iter().find(|object| object.object_id == id as u64))
+                .map(|object| object.components.transform.y as f64)
+                .unwrap_or(0.0)
+        });
+    }
+
+    {
+        let host = host_state.clone();
         engine.register_fn(
             "set_transform",
             move |id: i64, x: f64, y: f64, rot: f64, sx: f64, sy: f64| {
@@ -658,6 +765,25 @@ fn create_rhai_engine(host_state: Arc<Mutex<ScriptHostState>>) -> RhaiEngine {
 
     {
         let host = host_state.clone();
+        engine.register_fn("find_objects_with_tag", move |tag: &str| -> Vec<i64> {
+            let Ok(state) = host.lock() else {
+                return Vec::new();
+            };
+            let Some(scene) = state.scene.as_ref() else {
+                return Vec::new();
+            };
+            let needle = tag.trim().to_ascii_lowercase();
+            scene
+                .objects
+                .iter()
+                .filter(|object| object.tags.iter().any(|t| t.to_ascii_lowercase() == needle))
+                .map(|object| object.object_id as i64)
+                .collect()
+        });
+    }
+
+    {
+        let host = host_state.clone();
         engine.register_fn("get_custom", move |id: i64, key: &str| -> String {
             let Ok(state) = host.lock() else {
                 return String::new();
@@ -757,6 +883,102 @@ fn create_rhai_engine(host_state: Arc<Mutex<ScriptHostState>>) -> RhaiEngine {
         });
     }
 
+    {
+        let host = host_state.clone();
+        engine.register_fn("mouse_x", move || -> f64 {
+            let Ok(state) = host.lock() else {
+                return 0.0;
+            };
+            state.input.mouse_x as f64
+        });
+    }
+
+    {
+        let host = host_state.clone();
+        engine.register_fn("mouse_y", move || -> f64 {
+            let Ok(state) = host.lock() else {
+                return 0.0;
+            };
+            state.input.mouse_y as f64
+        });
+    }
+
+    {
+        let host = host_state.clone();
+        engine.register_fn("mouse_down", move |button: &str| -> bool {
+            let Ok(state) = host.lock() else {
+                return false;
+            };
+            state.input.mouse_down(button)
+        });
+    }
+
+    {
+        let host = host_state.clone();
+        engine.register_fn("draw_rect", move |x: f32, y: f32, width: f32, height: f32, r: i64, g: i64, b: i64, a: i64| {
+            let Ok(mut state) = host.lock() else {
+                return;
+            };
+            let color = [
+                r.clamp(0, 255) as u8,
+                g.clamp(0, 255) as u8,
+                b.clamp(0, 255) as u8,
+                a.clamp(0, 255) as u8,
+            ];
+            state.push_ui_command(UiCommand::rect(x, y, width, height, color));
+        });
+    }
+
+    {
+        let host = host_state.clone();
+        engine.register_fn("draw_rect", move |x: f64, y: f64, width: f64, height: f64, r: i64, g: i64, b: i64, a: i64| {
+            let Ok(mut state) = host.lock() else {
+                return;
+            };
+            let color = [
+                r.clamp(0, 255) as u8,
+                g.clamp(0, 255) as u8,
+                b.clamp(0, 255) as u8,
+                a.clamp(0, 255) as u8,
+            ];
+            state.push_ui_command(UiCommand::rect(x as f32, y as f32, width as f32, height as f32, color));
+        });
+    }
+
+    {
+        let host = host_state.clone();
+        engine.register_fn("draw_text", move |_text: &str, x: f32, y: f32, size: f32, r: i64, g: i64, b: i64, a: i64| {
+            let Ok(mut state) = host.lock() else {
+                return;
+            };
+            let color = [
+                r.clamp(0, 255) as u8,
+                g.clamp(0, 255) as u8,
+                b.clamp(0, 255) as u8,
+                a.clamp(0, 255) as u8,
+            ];
+            // Text is rendered as a colored rectangle placeholder until a font
+            // atlas is integrated into the renderer.
+            state.push_ui_command(UiCommand::text(x, y, size, color));
+        });
+    }
+
+    {
+        let host = host_state.clone();
+        engine.register_fn("draw_text", move |_text: &str, x: f64, y: f64, size: f64, r: i64, g: i64, b: i64, a: i64| {
+            let Ok(mut state) = host.lock() else {
+                return;
+            };
+            let color = [
+                r.clamp(0, 255) as u8,
+                g.clamp(0, 255) as u8,
+                b.clamp(0, 255) as u8,
+                a.clamp(0, 255) as u8,
+            ];
+            state.push_ui_command(UiCommand::text(x as f32, y as f32, size as f32, color));
+        });
+    }
+
     engine
 }
 
@@ -768,6 +990,7 @@ impl ScriptRuntime {
             logs: Vec::new(),
             next_object_id: 1000,
             input: RuntimeInputState::default(),
+            ui_commands: Vec::new(),
         }));
 
         let engine = create_rhai_engine(host_state.clone());
@@ -798,10 +1021,19 @@ impl ScriptRuntime {
         }
     }
 
-    fn set_input(&mut self, input: RuntimeInputState) {
+    fn set_input(&self, input: RuntimeInputState) {
         if let Ok(mut state) = self.host_state.lock() {
             state.input = input;
         }
+    }
+
+    fn drain_ui_commands(&self,
+    ) -> Vec<UiCommand> {
+        self.host_state
+            .lock()
+            .ok()
+            .map(|mut state| state.drain_ui_commands())
+            .unwrap_or_default()
     }
 
     fn take_scene(&self) -> Option<SceneDocument> {
@@ -1332,13 +1564,34 @@ impl EngineApp {
     }
 
     pub fn set_keyboard_input(&mut self, left: bool, right: bool, up: bool, down: bool) {
-        self.input_state = RuntimeInputState {
-            left,
-            right,
-            up,
-            down,
-        };
+        self.input_state.left = left;
+        self.input_state.right = right;
+        self.input_state.up = up;
+        self.input_state.down = down;
+        self.sync_input_to_script_runtime();
     }
+
+    pub fn set_mouse_input(
+        &mut self,
+        x: f32,
+        y: f32,
+        left: bool,
+        right: bool,
+        middle: bool,
+    ) {
+        self.input_state.mouse_x = x;
+        self.input_state.mouse_y = y;
+        self.input_state.mouse_left = left;
+        self.input_state.mouse_right = right;
+        self.input_state.mouse_middle = middle;
+        self.sync_input_to_script_runtime();
+    }
+
+    fn sync_input_to_script_runtime(&self,
+    ) {
+        self.script_runtime.set_input(self.input_state);
+    }
+
 
     pub fn set_viewport_camera(&mut self, x: f32, y: f32, zoom: f32) {
         self.viewport_camera = Camera2d {
@@ -1501,6 +1754,10 @@ impl EngineApp {
         Ok(())
     }
 
+    pub fn config(&self) -> &EngineConfig {
+        &self.config
+    }
+
     pub fn set_backend_override(
         &mut self,
         backend_preference: BackendPreference,
@@ -1644,6 +1901,7 @@ impl EngineApp {
         if let Some(artifact) = &self.compiled_graph {
             let mut submission_graph = artifact.render_graph.clone();
             self.inject_scene_sprites_into_render_graph(&mut submission_graph);
+            self.inject_ui_commands_into_render_graph(&mut submission_graph);
             self.apply_viewport_camera_to_render_graph(&mut submission_graph);
             optimize_submission_graph(&mut submission_graph);
             self.preload_shaders_for_graph(&submission_graph)?;
@@ -1769,6 +2027,48 @@ impl EngineApp {
         for pass in &mut graph.passes {
             if let RenderGraphPass::Render(render_pass) = pass {
                 render_pass.camera = self.viewport_camera;
+            }
+        }
+    }
+
+    fn inject_ui_commands_into_render_graph(&self, graph: &mut RenderGraph) {
+        let ui_commands = self.script_runtime.drain_ui_commands();
+        if ui_commands.is_empty() {
+            return;
+        }
+
+        let dummy_texture = TextureHandle(0);
+        let sprites: Vec<SpriteInstance> = ui_commands
+            .into_iter()
+            .map(|cmd| SpriteInstance {
+                texture: dummy_texture,
+                x: cmd.x,
+                y: cmd.y,
+                width: cmd.width,
+                height: cmd.height,
+                rotation_radians: 0.0,
+                tint: [
+                    cmd.r as f32 / 255.0,
+                    cmd.g as f32 / 255.0,
+                    cmd.b as f32 / 255.0,
+                    cmd.a as f32 / 255.0,
+                ],
+            })
+            .collect();
+
+        if sprites.is_empty() {
+            return;
+        }
+
+        for pass in &mut graph.passes {
+            if let RenderGraphPass::Render(render_pass) = pass {
+                render_pass.batches.push(SpriteBatchCommand {
+                    label: "ui_overlay".to_string(),
+                    blend: BlendMode::Alpha,
+                    target: render_pass.target,
+                    sprites,
+                });
+                return;
             }
         }
     }
@@ -2471,6 +2771,7 @@ mod tests {
             right: false,
             up: true,
             down: false,
+            ..Default::default()
         };
         assert!(input.key_down("left"));
         assert!(input.key_down("a"));

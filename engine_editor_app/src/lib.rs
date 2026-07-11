@@ -3608,6 +3608,23 @@ impl eframe::App for EditorUi {
             )
         });
         self.app.runtime.set_keyboard_input(left, right, up, down);
+
+        let (mouse_x, mouse_y, mouse_left, mouse_right) = ctx.input(|input| {
+            let pos = input.pointer.interact_pos().unwrap_or(input.pointer.latest_pos().unwrap_or_default());
+            (
+                pos.x,
+                pos.y,
+                input.pointer.button_down(egui::PointerButton::Primary),
+                input.pointer.button_down(egui::PointerButton::Secondary),
+            )
+        });
+        self.app.runtime.set_mouse_input(
+            mouse_x,
+            mouse_y,
+            mouse_left,
+            mouse_right,
+            false,
+        );
         self.app.runtime.set_viewport_camera(
             self.app.project.session.viewport.pan[0],
             self.app.project.session.viewport.pan[1],

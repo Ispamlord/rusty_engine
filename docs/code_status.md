@@ -67,6 +67,12 @@ Status legend:
 - DONE: Perf regression harness now measures full app-frame wall timing and records runtime/backend CPU timing breakdowns.
 - DONE: Core-topology aware scheduler tuning now models high-clock vs many-core balancing through configurable scheduler bias and worker limits.
 - **Runtime script jobs execute in dependency waves with conflict-safe parallel dispatch for independent jobs.** Script jobs can now declare explicit `read_set` / `write_set` settings; the runtime detects WAW, RAW, and WAR conflicts and only parallelizes non-conflicting jobs. Legacy `script_parallel_key` / `object_id` / `object_name` / `layer_id` markers continue to work.
+- DONE: Script runtime exposes mouse input (`mouse_x`, `mouse_y`, `mouse_down`) and sprite-based UI primitives (`draw_rect`, `draw_text` placeholder) for in-game HUDs.
+- DONE: Editor viewport forwards mouse position/buttons into the runtime so play-mode scripts can use mouse aim and click interactions.
+
+## Example Projects
+
+- DONE: `rusty-roguelike-shooter` is now an editor project under `project/` with a `.scene.ron`, Rhai scripts, and a standalone binary that loads the project via `EngineApp`. It uses mouse aiming/shooting, procedural enemy spawning, scaling difficulty, a shop every 2 levels, and sprite-based UI overlays.
 
 ## Recommended Next Milestones
 
